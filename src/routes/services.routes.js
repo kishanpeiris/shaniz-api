@@ -1,0 +1,156 @@
+import { Router } from 'express'
+import { z } from 'zod'
+import { query } from '../db/pool.js'
+import { requireRole } from '../middleware/auth.js'
+import { logBoth } from '../lib/log.js'
+
+const router = Router()
+
+// Same "units sold" approach as products.routes.js — see the comment
+// there. Purchasable and bookable services both create an order (a
+// booking's order_id points back to one), so this single query covers
+// both service types.
+const UNITS_SOLD_SUBQUERY = `
+  LEFT JOIN (
+    SELECT (item->>'id')::uuid AS service_id, SUM(COALESCE((item->>'qty')::int, 0)) AS qty
+    FROM orders o, jsonb_array_elements(o.items) AS item
+    WHERE o.status IN ('paid', 'shipped', 'completed') AND item->>'type' = 'service'
+    GROUP BY (item->>'id')::uuid
+  ) sold ON sold.service_id = s.id
+`
+
+router.get('/', async (req, res) => {
+  const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
+  const { rows } = await query(
+    `SELECT s.id, s.name, s.description, s.price_lkr, s.service_type, s.duration_minutes, s.images, s.is_active,
+            COALESCE(sold.qty, 0)::int AS units_sold
+     FROM services s
+     ${UNITS_SOLD_SUBQUERY}
+     ${isAdmin ? '' : 'WHERE s.is_active = TRUE'}
+     ORDER BY s.created_at DESC`
+  )
+  res.json({ services: rows })
+})
+
+const serviceSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  price_lkr: z.number().nonnegative(),
+  service_type: z.enum(['bookable', 'purchasable']),
+  duration_minutes: z.number().int().positive().optional(),
+  images: z.array(z.string().url()).optional(),
+  is_active: z.boolean().optional(),
+})
+
+router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = serviceSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const s = parsed.data
+  if (s.service_type === 'bookable' && !s.duration_minutes) {
+    return res.status(400).json({ error: 'duration_minutes is required for bookable services.' })
+  }
+
+  const { rows } = await query(
+    `INSERT INTO services (name, description, price_lkr, service_type, duration_minutes, images)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [s.name, s.description ?? null, s.price_lkr, s.service_type, s.duration_minutes ?? null, s.images ?? []]
+  )
+  await logBoth(req.user.id, 'service.created', rows[0].id)
+  res.status(201).json({ service: rows[0] })
+})
+
+router.put('/:id', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = serviceSchema.partial().safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const fields = parsed.data
+  const keys = Object.keys(fields)
+  if (keys.length === 0) return res.status(400).json({ error: 'No fields to update.' })
+
+  const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(', ')
+  const values = keys.map((k) => fields[k])
+  const { rows } = await query(
+    `UPDATE services SET ${setClause}, updated_at = now() WHERE id = $${keys.length + 1} RETURNING *`,
+    [...values, req.params.id]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Service not found.' })
+  await logBoth(req.user.id, 'service.updated', rows[0].id, fields)
+  res.json({ service: rows[0] })
+})
+
+router.delete('/:id', requireRole('admin', 'superadmin'), async (req, res) => {
+  await query('UPDATE services SET is_active = FALSE WHERE id = $1', [req.params.id])
+  await logBoth(req.user.id, 'service.deactivated', req.params.id)
+  res.json({ ok: true })
+})
+
+// ---- Admin: weekly availability windows ----
+router.get('/:id/availability', requireRole('admin', 'superadmin'), async (req, res) => {
+  const { rows } = await query(
+    `SELECT * FROM service_availability WHERE service_id = $1 ORDER BY day_of_week, start_time`,
+    [req.params.id]
+  )
+  res.json({ windows: rows })
+})
+
+const availabilitySchema = z.object({
+  day_of_week: z.number().int().min(0).max(6),
+  start_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  end_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+})
+
+router.post('/:id/availability', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = availabilitySchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const { day_of_week, start_time, end_time } = parsed.data
+
+  const { rows } = await query(
+    `INSERT INTO service_availability (service_id, day_of_week, start_time, end_time)
+     VALUES ($1,$2,$3,$4) RETURNING *`,
+    [req.params.id, day_of_week, start_time, end_time]
+  )
+  await logBoth(req.user.id, 'service.availability_added', req.params.id, parsed.data)
+  res.status(201).json({ window: rows[0] })
+})
+
+router.delete('/:id/availability/:windowId', requireRole('admin', 'superadmin'), async (req, res) => {
+  await query('DELETE FROM service_availability WHERE id = $1 AND service_id = $2', [
+    req.params.windowId,
+    req.params.id,
+  ])
+  await logBoth(req.user.id, 'service.availability_removed', req.params.windowId)
+  res.json({ ok: true })
+})
+
+// ---- Admin: blackout days (days off) ----
+router.get('/:id/blackouts', requireRole('admin', 'superadmin'), async (req, res) => {
+  const { rows } = await query(
+    `SELECT * FROM service_blackouts WHERE service_id = $1 ORDER BY blackout_date`,
+    [req.params.id]
+  )
+  res.json({ blackouts: rows })
+})
+
+router.post('/:id/blackouts', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = z
+    .object({ blackout_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), reason: z.string().optional() })
+    .safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  const { rows } = await query(
+    `INSERT INTO service_blackouts (service_id, blackout_date, reason) VALUES ($1,$2,$3) RETURNING *`,
+    [req.params.id, parsed.data.blackout_date, parsed.data.reason ?? null]
+  )
+  await logBoth(req.user.id, 'service.blackout_added', req.params.id, parsed.data)
+  res.status(201).json({ blackout: rows[0] })
+})
+
+router.delete('/:id/blackouts/:blackoutId', requireRole('admin', 'superadmin'), async (req, res) => {
+  await query('DELETE FROM service_blackouts WHERE id = $1 AND service_id = $2', [
+    req.params.blackoutId,
+    req.params.id,
+  ])
+  await logBoth(req.user.id, 'service.blackout_removed', req.params.blackoutId)
+  res.json({ ok: true })
+})
+
+export default router

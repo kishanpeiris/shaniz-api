@@ -1,0 +1,6 @@
+node_modules
+.env
+*.log
+
+# Local image-upload fallback (dev only — production uses Cloudinary)
+/uploads
