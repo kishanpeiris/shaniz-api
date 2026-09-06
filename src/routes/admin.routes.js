@@ -202,16 +202,40 @@ router.post('/outages', async (req, res) => {
   res.status(201).json({ outage: rows[0] })
 })
 
+// Maintenance mode now requires a schedule to turn ON — an admin picks
+// starts_at (required) and optionally ends_at (auto-clears once passed;
+// omit it to require a manual Turn Off instead). Turning OFF is always
+// instant and needs no schedule — this is the "how do I get back in"
+// escape hatch: since /admin and /login always bypass the customer-facing
+// placeholder (see the frontend's MaintenanceGate), an admin can log in
+// and hit Turn Off at any time, even while the placeholder is showing to
+// everyone else.
 router.put('/maintenance-mode', async (req, res) => {
-  const parsed = z.object({ enabled: z.boolean() }).safeParse(req.body)
-  if (!parsed.success) return res.status(400).json({ error: 'enabled must be boolean.' })
+  const parsed = z
+    .discriminatedUnion('enabled', [
+      z.object({
+        enabled: z.literal(true),
+        starts_at: z.string().datetime(),
+        ends_at: z.string().datetime().optional(),
+        reason: z.string().optional(),
+      }),
+      z.object({ enabled: z.literal(false) }),
+    ])
+    .safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
 
-  await query(
-    `UPDATE site_settings SET value = $1 WHERE key = 'maintenance_mode'`,
-    [JSON.stringify(parsed.data.enabled)]
-  )
-  await logBoth(req.user.id, parsed.data.enabled ? 'maintenance.enabled' : 'maintenance.disabled')
-  res.json({ maintenance_mode: parsed.data.enabled })
+  const value = parsed.data.enabled
+    ? {
+        enabled: true,
+        starts_at: parsed.data.starts_at,
+        ends_at: parsed.data.ends_at ?? null,
+        reason: parsed.data.reason ?? null,
+      }
+    : { enabled: false }
+
+  await query(`UPDATE site_settings SET value = $1 WHERE key = 'maintenance_mode'`, [JSON.stringify(value)])
+  await logBoth(req.user.id, parsed.data.enabled ? 'maintenance.scheduled' : 'maintenance.disabled')
+  res.json({ maintenance_schedule: value })
 })
 
 export default router

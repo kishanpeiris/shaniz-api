@@ -22,8 +22,25 @@ router.get('/status', async (req, res) => {
     query(`SELECT value FROM site_settings WHERE key = 'business_info'`),
   ])
 
+  // Maintenance mode is schedule-driven, not a bare on/off switch (an
+  // admin sets starts_at, and optionally ends_at, from the Maintenance
+  // page) — compute whether it's ACTUALLY in effect right now, server
+  // side, so client clock differences can't matter. Older/legacy rows
+  // (a plain `true`/`false` from before this was schedule-based) are
+  // handled too: a bare `true` is treated as "on with no schedule",
+  // active immediately.
+  const raw = settings.rows[0]?.value
+  const schedule =
+    typeof raw === 'boolean' ? { enabled: raw, starts_at: null, ends_at: null, reason: null } : raw || { enabled: false }
+
+  const now = Date.now()
+  const startsAt = schedule.starts_at ? new Date(schedule.starts_at).getTime() : null
+  const endsAt = schedule.ends_at ? new Date(schedule.ends_at).getTime() : null
+  const maintenanceActive = Boolean(schedule.enabled) && (startsAt === null || now >= startsAt) && (endsAt === null || now <= endsAt)
+
   res.json({
-    maintenance_mode: settings.rows[0]?.value === true,
+    maintenance_mode: maintenanceActive,
+    maintenance_schedule: schedule,
     upcoming_outage: outages.rows[0] ?? null,
     business_info: businessInfo.rows[0]?.value ?? null,
   })
