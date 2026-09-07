@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
+import { generateProductDescription } from '../lib/ai.js'
 
 const router = Router()
 
@@ -12,7 +13,7 @@ const router = Router()
 
 // ---- Dashboard (Section 8) ----
 router.get('/dashboard', async (req, res) => {
-  const [revenue, ordersByStatus, upcomingBookings, topProducts, lowStock, gatewaySplit, aov, signups, guestRatio] =
+  const [revenue, ordersByStatus, upcomingBookings, topProducts, lowStock, gatewaySplit, aov, signups, guestRatio, openFraudFlags, recentFraudFlags, failedAdminLogins, newAdmins] =
     await Promise.all([
       query(`SELECT date_trunc('day', created_at) AS day, SUM(total_lkr) AS revenue
              FROM orders WHERE status IN ('paid','shipped','completed') AND created_at > now() - interval '30 days'
@@ -28,6 +29,16 @@ router.get('/dashboard', async (req, res) => {
                COUNT(*) FILTER (WHERE user_id IS NULL) AS guest,
                COUNT(*) FILTER (WHERE user_id IS NOT NULL) AS logged_in
              FROM orders`),
+      query(`SELECT COUNT(*)::int AS n FROM fraud_flags WHERE resolved = FALSE`),
+      query(`SELECT f.id, f.severity, f.code, f.message, f.created_at, f.order_id
+             FROM fraud_flags f WHERE f.resolved = FALSE ORDER BY f.created_at DESC LIMIT 5`),
+      // Security widget (Section 8): recent failed logins for admin/superadmin
+      // accounts specifically — a failed customer login isn't the same signal.
+      query(`SELECT COUNT(*)::int AS n FROM login_attempts la
+             JOIN users u ON LOWER(u.email) = LOWER(la.email)
+             WHERE la.success = FALSE AND u.role IN ('admin','superadmin')
+               AND la.created_at > now() - interval '24 hours'`),
+      query(`SELECT COUNT(*)::int AS n FROM users WHERE role IN ('admin','superadmin') AND created_at > now() - interval '7 days'`),
     ])
 
   // Top products by revenue/units — computed in JS since items live in JSONB.
@@ -55,7 +66,55 @@ router.get('/dashboard', async (req, res) => {
     average_order_value_lkr: Number(aov.rows[0].aov ?? 0),
     new_signups_by_day: signups.rows,
     guest_vs_logged_in: guestRatio.rows[0],
+    security: {
+      open_fraud_flags: openFraudFlags.rows[0].n,
+      recent_fraud_flags: recentFraudFlags.rows,
+      failed_admin_logins_24h: failedAdminLogins.rows[0].n,
+      new_admin_accounts_7d: newAdmins.rows[0].n,
+    },
   })
+})
+
+// ---- AI-assisted product description (ingredient-based, no web search) ----
+const aiDescriptionSchema = z.object({
+  name: z.string().min(1),
+  category: z.string().optional(),
+  hint: z.string().max(500).optional(),
+})
+
+router.post('/ai/product-description', async (req, res) => {
+  const parsed = aiDescriptionSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  try {
+    const description = await generateProductDescription(parsed.data)
+    await logBoth(req.user.id, 'ai.description_generated', null, { product_name: parsed.data.name })
+    res.json({ description })
+  } catch (err) {
+    res.status(err.status ?? 500).json({ error: err.message })
+  }
+})
+
+// ---- Fraud flags (rule-based checks — see src/lib/fraud.js) ----
+router.get('/fraud-flags', async (req, res) => {
+  const onlyOpen = req.query.status !== 'all'
+  const { rows } = await query(
+    `SELECT f.*, o.total_lkr, o.customer_email, o.customer_first_name, o.customer_last_name
+     FROM fraud_flags f JOIN orders o ON o.id = f.order_id
+     ${onlyOpen ? 'WHERE f.resolved = FALSE' : ''}
+     ORDER BY f.created_at DESC LIMIT 200`
+  )
+  res.json({ fraud_flags: rows })
+})
+
+router.put('/fraud-flags/:id/resolve', async (req, res) => {
+  const { rows } = await query(
+    `UPDATE fraud_flags SET resolved = TRUE, resolved_by = $1, resolved_at = now() WHERE id = $2 RETURNING *`,
+    [req.user.id, req.params.id]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Flag not found.' })
+  await logBoth(req.user.id, 'fraud.resolved', rows[0].order_id)
+  res.json({ fraud_flag: rows[0] })
 })
 
 // ---- Logs ----
@@ -74,11 +133,63 @@ router.get('/activity-log', async (req, res) => {
 })
 
 // ---- Customer account management ----
+// Expanded per the registration overhaul: shows verification status plus
+// order count / total spent / booking count so an admin doesn't have to
+// open every customer individually just to see who's actually active.
 router.get('/customers', async (req, res) => {
   const { rows } = await query(
-    `SELECT id, name, email, disabled, created_at FROM users WHERE role = 'customer' ORDER BY created_at DESC LIMIT 500`
+    `SELECT
+       u.id, u.name, u.first_name, u.last_name, u.email, u.mobile,
+       u.email_verified, u.disabled, u.created_at,
+       COALESCE(o.order_count, 0) AS order_count,
+       COALESCE(o.total_spent_lkr, 0) AS total_spent_lkr,
+       COALESCE(b.booking_count, 0) AS booking_count
+     FROM users u
+     LEFT JOIN (
+       SELECT user_id, COUNT(*) AS order_count, SUM(total_lkr) AS total_spent_lkr
+       FROM orders WHERE user_id IS NOT NULL GROUP BY user_id
+     ) o ON o.user_id = u.id
+     LEFT JOIN (
+       SELECT user_id, COUNT(*) AS booking_count
+       FROM bookings WHERE user_id IS NOT NULL GROUP BY user_id
+     ) b ON b.user_id = u.id
+     WHERE u.role = 'customer'
+     ORDER BY u.created_at DESC LIMIT 500`
   )
   res.json({ customers: rows })
+})
+
+// Full detail view for one customer: profile, saved addresses, recent
+// orders, recent bookings — everything an admin might need without
+// jumping between the Orders/Bookings pages and filtering manually.
+router.get('/customers/:id', async (req, res) => {
+  const [user, addresses, orders, bookings] = await Promise.all([
+    query(
+      `SELECT id, name, first_name, last_name, email, mobile, email_verified, disabled, created_at
+       FROM users WHERE id = $1 AND role = 'customer'`,
+      [req.params.id]
+    ),
+    query('SELECT * FROM addresses WHERE user_id = $1 ORDER BY created_at DESC', [req.params.id]),
+    query(
+      `SELECT id, items, total_lkr, status, gateway_used, created_at FROM orders
+       WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50`,
+      [req.params.id]
+    ),
+    query(
+      `SELECT b.id, b.booked_date, b.booked_time, b.status, s.name AS service_name
+       FROM bookings b JOIN services s ON s.id = b.service_id
+       WHERE b.user_id = $1 ORDER BY b.booked_date DESC, b.booked_time DESC LIMIT 50`,
+      [req.params.id]
+    ),
+  ])
+  if (!user.rows[0]) return res.status(404).json({ error: 'Customer not found.' })
+
+  res.json({
+    customer: user.rows[0],
+    addresses: addresses.rows,
+    orders: orders.rows,
+    bookings: bookings.rows,
+  })
 })
 
 router.put('/customers/:id/disabled', async (req, res) => {
@@ -92,6 +203,46 @@ router.put('/customers/:id/disabled', async (req, res) => {
   if (!rows[0]) return res.status(404).json({ error: 'Customer not found.' })
   await logBoth(req.user.id, parsed.data.disabled ? 'customer.disabled' : 'customer.enabled', rows[0].id)
   res.json({ customer: rows[0] })
+})
+
+// ---- Blacklisted emails (registration overhaul) ----
+// Blocks specific addresses from ever registering (spam/abuse). Does NOT
+// touch any existing account — it only affects future /api/auth/register
+// attempts (see auth.routes.js).
+router.get('/blacklist', async (req, res) => {
+  const { rows } = await query(
+    `SELECT b.id, b.email, b.reason, b.created_at, u.name AS created_by_name
+     FROM blacklisted_emails b LEFT JOIN users u ON u.id = b.created_by
+     ORDER BY b.created_at DESC`
+  )
+  res.json({ blacklist: rows })
+})
+
+const blacklistSchema = z.object({
+  email: z.string().email(),
+  reason: z.string().max(300).optional(),
+})
+
+router.post('/blacklist', async (req, res) => {
+  const parsed = blacklistSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const email = parsed.data.email.toLowerCase()
+
+  const existing = await query('SELECT id FROM blacklisted_emails WHERE LOWER(email) = $1', [email])
+  if (existing.rows.length) return res.status(409).json({ error: 'That email is already blacklisted.' })
+
+  const { rows } = await query(
+    `INSERT INTO blacklisted_emails (email, reason, created_by) VALUES ($1, $2, $3) RETURNING *`,
+    [email, parsed.data.reason ?? null, req.user.id]
+  )
+  await logBoth(req.user.id, 'blacklist.added', rows[0].id, { email })
+  res.status(201).json({ entry: rows[0] })
+})
+
+router.delete('/blacklist/:id', async (req, res) => {
+  await query('DELETE FROM blacklisted_emails WHERE id = $1', [req.params.id])
+  await logBoth(req.user.id, 'blacklist.removed', req.params.id)
+  res.json({ ok: true })
 })
 
 // ---- Admin management (superadmin only) ----
@@ -120,7 +271,7 @@ router.post('/admins', requireRole('superadmin'), async (req, res) => {
 
   const passwordHash = await bcrypt.hash(password, 12)
   const { rows } = await query(
-    `INSERT INTO users (name, email, password_hash, role) VALUES ($1,$2,$3,$4)
+    `INSERT INTO users (name, email, password_hash, role, email_verified) VALUES ($1,$2,$3,$4,TRUE)
      RETURNING id, name, email, role`,
     [name, email, passwordHash, role]
   )

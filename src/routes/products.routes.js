@@ -27,7 +27,8 @@ const UNITS_SOLD_SUBQUERY = `
 router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const { rows } = await query(
-    `SELECT p.id, p.name, p.description, p.price_lkr, p.stock_qty, p.category, p.images, p.hover_gif_url, p.is_active,
+    `SELECT p.id, p.name, p.description, p.price_lkr, p.stock_qty, p.category, p.images,
+            p.hover_gif_url, p.hover_video_url, p.hover_webp_url, p.is_active,
             p.availability_mode, p.preorder_eta_days,
             (p.stock_qty = 0) AS out_of_stock,
             CASE
@@ -67,6 +68,12 @@ const productSchema = z.object({
   category: z.string().optional(),
   images: z.array(z.string().url()).optional(),
   hover_gif_url: z.string().url().optional(),
+  // Preferred over hover_gif_url going forward: hover_video_url is tried
+  // first on the storefront, hover_webp_url second, hover_gif_url last
+  // (kept only so products uploaded before this existed keep their
+  // hover effect without needing a re-upload).
+  hover_video_url: z.string().url().optional(),
+  hover_webp_url: z.string().url().optional(),
   is_active: z.boolean().optional(),
   availability_mode: z.enum(['in_stock', 'out_of_stock', 'preorder']).optional(),
   preorder_eta_days: z.number().int().positive().nullable().optional(),
@@ -80,8 +87,8 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const p = parsed.data
 
   const { rows } = await query(
-    `INSERT INTO products (name, description, price_lkr, stock_qty, category, images, hover_gif_url, availability_mode, preorder_eta_days)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    `INSERT INTO products (name, description, price_lkr, stock_qty, category, images, hover_gif_url, hover_video_url, hover_webp_url, availability_mode, preorder_eta_days)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
     [
       p.name,
       p.description ?? null,
@@ -90,6 +97,8 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
       p.category ?? null,
       p.images ?? [],
       p.hover_gif_url ?? null,
+      p.hover_video_url ?? null,
+      p.hover_webp_url ?? null,
       p.availability_mode ?? 'in_stock',
       p.preorder_eta_days ?? null,
     ]

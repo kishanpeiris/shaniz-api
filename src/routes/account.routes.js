@@ -4,6 +4,7 @@ import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { requireAuth } from '../middleware/auth.js'
 import { logBoth, logActivity } from '../lib/log.js'
+import { serializeUser } from '../lib/serializeUser.js'
 
 const router = Router()
 
@@ -13,25 +14,37 @@ router.use(requireAuth)
 
 // ---- Profile ----
 router.get('/profile', async (req, res) => {
-  const { rows } = await query('SELECT id, name, email, role, created_at FROM users WHERE id = $1', [
-    req.user.id,
-  ])
-  res.json({ user: rows[0] })
+  const { rows } = await query(
+    `SELECT id, name, first_name, last_name, email, mobile, role, email_verified, disabled, created_at
+     FROM users WHERE id = $1`,
+    [req.user.id]
+  )
+  res.json({ user: serializeUser(rows[0]) })
 })
 
+// lastName stays optional (mononym-friendly). When either name field
+// changes, `name` (the single combined display name used everywhere
+// else in the app) is recomputed to match.
 const profileSchema = z.object({
-  name: z.string().min(1).max(200),
+  firstName: z.string().min(1).max(100),
+  lastName: z.string().min(1).max(100).optional(),
+  mobile: z.string().min(7).max(20).optional().or(z.literal('')),
 })
 
 router.put('/profile', async (req, res) => {
   const parsed = profileSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const { firstName, lastName, mobile } = parsed.data
+  const name = lastName ? `${firstName} ${lastName}` : firstName
+
   const { rows } = await query(
-    'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, name, email, role',
-    [parsed.data.name, req.user.id]
+    `UPDATE users SET name = $1, first_name = $2, last_name = $3, mobile = $4
+     WHERE id = $5
+     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, disabled, created_at`,
+    [name, firstName, lastName || null, mobile || null, req.user.id]
   )
   await logActivity(req.user.id, 'account.profile_updated')
-  res.json({ user: rows[0] })
+  res.json({ user: serializeUser(rows[0]) })
 })
 
 // Change password while logged in (different flow from forgot/reset-password,

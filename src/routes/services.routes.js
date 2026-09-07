@@ -22,7 +22,8 @@ const UNITS_SOLD_SUBQUERY = `
 router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const { rows } = await query(
-    `SELECT s.id, s.name, s.description, s.price_lkr, s.service_type, s.duration_minutes, s.images, s.is_active,
+    `SELECT s.id, s.name, s.description, s.price_lkr, s.service_type, s.duration_minutes, s.images,
+            s.hover_video_url, s.hover_webp_url, s.hover_gif_url, s.is_active,
             COALESCE(sold.qty, 0)::int AS units_sold
      FROM services s
      ${UNITS_SOLD_SUBQUERY}
@@ -32,6 +33,14 @@ router.get('/', async (req, res) => {
   res.json({ services: rows })
 })
 
+// Public detail view — same shape as GET /api/products/:id, used by the
+// new ServiceDetailPage.
+router.get('/:id', async (req, res) => {
+  const { rows } = await query('SELECT * FROM services WHERE id = $1 AND is_active = TRUE', [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Service not found.' })
+  res.json({ service: rows[0] })
+})
+
 const serviceSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
@@ -39,6 +48,11 @@ const serviceSchema = z.object({
   service_type: z.enum(['bookable', 'purchasable']),
   duration_minutes: z.number().int().positive().optional(),
   images: z.array(z.string().url()).optional(),
+  // Same hover-preference order as products: video, then webp, then the
+  // legacy gif field, then just the first image in `images`.
+  hover_video_url: z.string().url().optional(),
+  hover_webp_url: z.string().url().optional(),
+  hover_gif_url: z.string().url().optional(),
   is_active: z.boolean().optional(),
 })
 
@@ -51,9 +65,19 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   }
 
   const { rows } = await query(
-    `INSERT INTO services (name, description, price_lkr, service_type, duration_minutes, images)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [s.name, s.description ?? null, s.price_lkr, s.service_type, s.duration_minutes ?? null, s.images ?? []]
+    `INSERT INTO services (name, description, price_lkr, service_type, duration_minutes, images, hover_video_url, hover_webp_url, hover_gif_url)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [
+      s.name,
+      s.description ?? null,
+      s.price_lkr,
+      s.service_type,
+      s.duration_minutes ?? null,
+      s.images ?? [],
+      s.hover_video_url ?? null,
+      s.hover_webp_url ?? null,
+      s.hover_gif_url ?? null,
+    ]
   )
   await logBoth(req.user.id, 'service.created', rows[0].id)
   res.status(201).json({ service: rows[0] })

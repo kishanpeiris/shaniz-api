@@ -18,6 +18,16 @@ export const passwordResetLimiter = rateLimit({
   message: { error: 'Too many reset requests. Try again later.' },
 })
 
+// Same shape as passwordResetLimiter, kept separate so tightening one
+// doesn't accidentally tighten the other.
+export const verificationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many verification requests. Try again later.' },
+})
+
 // A gentler general limiter for the rest of the API.
 export const apiLimiter = rateLimit({
   windowMs: 60 * 1000,

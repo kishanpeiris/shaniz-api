@@ -4,6 +4,7 @@ import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
 import { sendBookingConfirmationEmail, sendBookingUpdateEmail } from '../lib/email.js'
+import { sendBookingConfirmationSms } from '../lib/sms.js'
 
 const router = Router()
 
@@ -75,23 +76,36 @@ const bookingSchema = z.object({
   service_id: z.string().uuid(),
   booked_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   booked_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  // Only required for guest bookings (no session) — see the check below.
+  // guest_name is one field (not first/last) since it's just for display
+  // and the confirmation email; mononym-friendly by not splitting it.
+  guest_name: z.string().min(1).max(200).optional(),
   guest_email: z.string().email().optional(),
+  guest_mobile: z.string().min(7).max(20).optional(),
 })
 
 router.post('/', async (req, res) => {
   const parsed = bookingSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
-  const { service_id, booked_date, booked_time, guest_email } = parsed.data
+  const { service_id, booked_date, booked_time, guest_name, guest_email, guest_mobile } = parsed.data
 
-  if (!req.user && !guest_email) {
-    return res.status(400).json({ error: 'guest_email is required when not signed in.' })
+  if (!req.user && (!guest_name || !guest_email)) {
+    return res.status(400).json({ error: 'guest_name and guest_email are required when not signed in.' })
   }
 
   try {
     const { rows } = await query(
-      `INSERT INTO bookings (service_id, user_id, guest_email, booked_date, booked_time)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [service_id, req.user?.id ?? null, req.user ? null : guest_email, booked_date, booked_time]
+      `INSERT INTO bookings (service_id, user_id, guest_name, guest_email, guest_mobile, booked_date, booked_time)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [
+        service_id,
+        req.user?.id ?? null,
+        req.user ? null : guest_name,
+        req.user ? null : guest_email,
+        req.user ? null : guest_mobile ?? null,
+        booked_date,
+        booked_time,
+      ]
     )
     await logBoth(req.user?.id ?? null, 'booking.created', rows[0].id)
 
@@ -99,6 +113,12 @@ router.post('/', async (req, res) => {
     const serviceRow = await query('SELECT name FROM services WHERE id = $1', [service_id])
     if (recipientEmail) {
       await sendBookingConfirmationEmail(rows[0], serviceRow.rows[0]?.name ?? 'Service', recipientEmail)
+    }
+    // Mobile is optional for both guests and logged-in customers — only
+    // sent if one is actually on file.
+    const recipientMobile = req.user?.mobile ?? guest_mobile
+    if (recipientMobile) {
+      await sendBookingConfirmationSms(rows[0], serviceRow.rows[0]?.name ?? 'Service', recipientMobile)
     }
 
     res.status(201).json({ booking: rows[0] })
@@ -126,8 +146,10 @@ router.get('/mine', async (req, res) => {
 // Admin: calendar view of all upcoming bookings.
 router.get('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const { rows } = await query(
-    `SELECT b.*, s.name AS service_name FROM bookings b
+    `SELECT b.*, s.name AS service_name, u.name AS user_name, u.email AS user_email
+     FROM bookings b
      JOIN services s ON s.id = b.service_id
+     LEFT JOIN users u ON u.id = b.user_id
      WHERE b.booked_date >= CURRENT_DATE AND b.status != 'cancelled'
      ORDER BY b.booked_date, b.booked_time`
   )

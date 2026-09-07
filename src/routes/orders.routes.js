@@ -3,9 +3,12 @@ import { z } from 'zod'
 import { query, pool } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth, logAudit } from '../lib/log.js'
-import { sendOrderConfirmationEmail, sendShippingNoticeEmail, sendInvoiceEmail } from '../lib/email.js'
+import { sendOrderConfirmationEmail, sendShippingNoticeEmail, sendInvoiceEmail, sendFraudAlertEmail } from '../lib/email.js'
+import { sendOrderConfirmationSms } from '../lib/sms.js'
 import { createCheckoutSession, GATEWAYS } from '../lib/gateways.js'
 import { deliveryFee, isValidRegion } from '../lib/delivery.js'
+import { evaluateOrderRisk, recordFraudFlags } from '../lib/fraud.js'
+import { getSuperadminEmails } from '../lib/notifications.js'
 
 const router = Router()
 
@@ -194,8 +197,8 @@ router.post('/', async (req, res) => {
          user_id, guest_email, items, total_lkr, gateway_used,
          customer_first_name, customer_last_name, customer_phone, customer_email,
          delivery_method, delivery_region, delivery_fee_lkr,
-         shipping_address, billing_address, save_card_requested
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+         shipping_address, billing_address, save_card_requested, customer_ip
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
       [
         userId,
         userId ? null : d.guest_email,
@@ -212,15 +215,46 @@ router.post('/', async (req, res) => {
         shippingSnapshot ? JSON.stringify(shippingSnapshot) : null,
         billingSnapshot ? JSON.stringify(billingSnapshot) : null,
         Boolean(d.save_card && userId && d.gateway === 'dialog_genie'),
+        req.ip,
       ]
     )
 
+    const order = orderRows[0]
+
+    // Fraud check runs inside this same transaction so the "past orders"
+    // counts it looks at are consistent with the order just inserted
+    // above. A rule tripping never blocks the order — it only flags it
+    // for a human to glance at.
+    const fraudFlags = await evaluateOrderRisk(client, {
+      orderId: order.id,
+      userId,
+      guestEmail: userId ? null : d.guest_email,
+      customerEmail,
+      totalLkr: total,
+      ip: req.ip,
+      billingAddress: billingSnapshot,
+      billingSameAsShipping: d.billing_same_as_shipping,
+      customerFirstName: d.first_name,
+      customerLastName: d.last_name,
+    })
+    if (fraudFlags.length > 0) await recordFraudFlags(client, order.id, fraudFlags)
+
     await client.query('COMMIT')
 
-    const order = orderRows[0]
     await logBoth(userId, 'order.created', order.id, { total, gateway: d.gateway })
 
     if (customerEmail) await sendOrderConfirmationEmail(order, customerEmail)
+    await sendOrderConfirmationSms(order, d.phone)
+
+    // Notify admins outside the transaction (an email failure should
+    // never roll back a real order) — only for flags worth interrupting
+    // someone's day over. Low-severity-only flags still show up in the
+    // admin panel, just without an email.
+    if (fraudFlags.some((f) => f.severity !== 'low')) {
+      const superadminEmails = await getSuperadminEmails()
+      await Promise.all(superadminEmails.map((email) => sendFraudAlertEmail(order, fraudFlags, email)))
+      await logAudit(null, 'fraud.flagged', order.id, { codes: fraudFlags.map((f) => f.code) })
+    }
 
     // Once KOKO_/INTPAY_/DIALOG_GENIE_ env vars are set (project-spec.md
     // Section 4), this calls the real gateway; until then it returns a

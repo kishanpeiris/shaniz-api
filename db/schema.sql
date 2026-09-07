@@ -24,6 +24,46 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE UNIQUE INDEX IF NOT EXISTS one_primary_superadmin
   ON users (is_primary_superadmin) WHERE is_primary_superadmin = TRUE;
 
+-- ---------------------------------------------------------------------
+-- Customer registration overhaul: separate first/last name (last_name
+-- stays nullable — some people go by one name, "mononym-friendly"),
+-- an optional mobile number, and an email-verified flag. `name` (above)
+-- is kept as the single combined display name so every existing page
+-- that already reads `user.name` keeps working unchanged.
+-- ---------------------------------------------------------------------
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Defense in depth alongside app-level lowercasing on register/login/
+-- forgot-password: guarantees "a@x.com" and "A@X.com" can never both
+-- register, even if a future code path forgets to lowercase first.
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_unique ON users (LOWER(email));
+
+-- Single-use, time-limited tokens emailed to confirm an address — same
+-- pattern as password_reset_tokens below, just for a different purpose.
+CREATE TABLE IF NOT EXISTS email_verify_tokens (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_email_verify_tokens_user ON email_verify_tokens (user_id);
+
+-- Emails an admin has blocked from ever registering (spam/abuse). Checked
+-- at registration time; rejection message is deliberately vague so it
+-- doesn't confirm to the person that they've been specifically blocked.
+CREATE TABLE IF NOT EXISTS blacklisted_emails (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email      TEXT NOT NULL UNIQUE,
+  reason     TEXT,
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE OR REPLACE FUNCTION prevent_primary_superadmin_delete()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -114,6 +154,8 @@ CREATE TABLE IF NOT EXISTS products (
   category      TEXT,
   images        TEXT[] DEFAULT '{}',
   hover_gif_url TEXT,
+  hover_video_url TEXT, -- looping WebM clip, tried first on hover
+  hover_webp_url  TEXT, -- animated WebP, tried second (hover_gif_url kept only for older uploads)
   is_active     BOOLEAN NOT NULL DEFAULT TRUE, -- auto-set false when out of stock, or admin can hide manually
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -141,6 +183,9 @@ CREATE TABLE IF NOT EXISTS services (
   service_type TEXT NOT NULL CHECK (service_type IN ('bookable', 'purchasable')),
   duration_minutes INTEGER, -- required for bookable services
   images       TEXT[] DEFAULT '{}',
+  hover_video_url TEXT, -- same hover treatment as products: video first
+  hover_webp_url  TEXT, -- then animated webp
+  hover_gif_url   TEXT, -- then legacy gif, then falls back to images[0]
   is_active    BOOLEAN NOT NULL DEFAULT TRUE,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -206,6 +251,9 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_fee_lkr NUMERIC(12,2) NOT N
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_address JSONB;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS billing_address JSONB;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS save_card_requested BOOLEAN NOT NULL DEFAULT FALSE;
+-- Captured at checkout time for the fraud-detection velocity check below
+-- (same IP placing many orders quickly). Never shown to the customer.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_ip TEXT;
 DO $$ BEGIN
   ALTER TABLE orders ADD CONSTRAINT orders_delivery_method_check CHECK (delivery_method IN ('pickup', 'delivery'));
 EXCEPTION WHEN duplicate_object THEN NULL;
@@ -231,7 +279,9 @@ CREATE TABLE IF NOT EXISTS bookings (
   service_id   UUID NOT NULL REFERENCES services(id),
   order_id     UUID REFERENCES orders(id) ON DELETE SET NULL,
   user_id      UUID REFERENCES users(id) ON DELETE SET NULL, -- nullable: guest booking
+  guest_name   TEXT, -- collected for guest bookings (mononym-friendly, stored as one field)
   guest_email  TEXT,
+  guest_mobile TEXT,
   booked_date  DATE NOT NULL,
   booked_time  TIME NOT NULL,
   status       TEXT NOT NULL DEFAULT 'confirmed'
@@ -280,6 +330,26 @@ CREATE TABLE IF NOT EXISTS activity_log (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log (created_at);
+
+-- ---------------------------------------------------------------------
+-- Fraud detection (rule-based — see src/lib/fraud.js). Every check runs
+-- automatically when an order is created; a row here means one rule
+-- tripped, not that fraud is confirmed. Admins clear flags manually
+-- once reviewed.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS fraud_flags (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id    UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  severity    TEXT NOT NULL CHECK (severity IN ('low', 'medium', 'high')),
+  code        TEXT NOT NULL, -- e.g. 'order_velocity', 'disposable_email'
+  message     TEXT NOT NULL, -- human-readable, shown directly in the admin panel
+  resolved    BOOLEAN NOT NULL DEFAULT FALSE,
+  resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  resolved_at TIMESTAMPTZ,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fraud_flags_order ON fraud_flags (order_id);
+CREATE INDEX IF NOT EXISTS idx_fraud_flags_unresolved ON fraud_flags (resolved, created_at);
 
 -- ---------------------------------------------------------------------
 -- Maintenance mode & outage calendar (Section 10)

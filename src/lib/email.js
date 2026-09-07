@@ -117,6 +117,33 @@ export async function sendPasswordResetEmail(toEmail, resetUrl) {
   return send({ to: toEmail, subject: 'Reset your Shani\u2019z password', html })
 }
 
+export async function sendVerificationEmail(toEmail, verifyUrl) {
+  const html = layout(
+    'Confirm Your Email',
+    `
+      <p>Thanks for creating a Shani&rsquo;z account. Click the link below to confirm this email address. This link expires in 24 hours.</p>
+      <p><a href="${verifyUrl}" style="color:#2b3a2f;">${verifyUrl}</a></p>
+      <p style="font-size:13px; color:#5c5949;">If you didn't create this account, you can ignore this email.</p>
+    `
+  )
+  return send({ to: toEmail, subject: 'Confirm your Shani\u2019z email address', html })
+}
+
+export async function sendFraudAlertEmail(order, flags, toEmail) {
+  const rows = flags
+    .map((f) => `<li><strong>${f.severity.toUpperCase()}</strong> — ${f.message}</li>`)
+    .join('')
+  const html = layout(
+    'Fraud Check Flagged an Order',
+    `
+      <p>Order <strong>${order.id}</strong> (Rs. ${Number(order.total_lkr).toLocaleString()}) tripped the following automatic check${flags.length > 1 ? 's' : ''}:</p>
+      <ul>${rows}</ul>
+      <p style="font-size:13px; color:#5c5949;">This isn't a confirmation of fraud — just worth a quick look before shipping. Review it from Admin → Fraud Alerts.</p>
+    `
+  )
+  return send({ to: toEmail, subject: `⚠ Order flagged for review — ${order.id.slice(0, 8)}`, html })
+}
+
 export async function sendInvoiceEmail(order, toEmail, pdfUrl) {
   const html = layout(
     'Your Invoice',

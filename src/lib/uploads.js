@@ -14,8 +14,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // crafted SVG-as-PNG, etc.) — that's the "scan" step here, there's no
 // separate antivirus service in this stack.
 
-const MAX_BYTES = 8 * 1024 * 1024 // 8MB
+const MAX_BYTES = 8 * 1024 * 1024 // 8MB — still images
+const MAX_VIDEO_BYTES = 15 * 1024 * 1024 // 15MB — short looping hover clips only
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+const ALLOWED_VIDEO_MIME = new Set(['video/webm'])
 
 const cloudinaryConfigured = Boolean(
   process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET
@@ -53,12 +55,15 @@ function validate(file) {
 }
 
 // Re-encodes the image (stripping any non-image payload) and returns a
-// { buffer, ext, contentType } ready to store. Animated GIFs are
-// re-encoded frame-by-frame so hover-loop animations survive (spec
-// Section 5: "Hover-state GIFs ... 2-4 sec loops").
+// { buffer, ext, contentType } ready to store. Animated GIFs *and*
+// animated WebPs are re-encoded frame-by-frame so hover-loop animations
+// survive (spec Section 5: "Hover-state GIFs/WebPs ... 2-4 sec loops") —
+// passing animated:false here for an animated WebP would silently keep
+// only its first frame, so both formats opt in.
 async function reencode(file) {
   const isGif = file.mimetype === 'image/gif'
-  const img = sharp(file.buffer, { animated: isGif, limitInputPixels: 268402689 })
+  const isWebp = file.mimetype === 'image/webp'
+  const img = sharp(file.buffer, { animated: isGif || isWebp, limitInputPixels: 268402689 })
   const metadata = await img.metadata()
 
   // Cap dimensions — product/hero images never need to be larger than
@@ -72,15 +77,16 @@ async function reencode(file) {
     const buffer = await img.gif().toBuffer()
     return { buffer, ext: 'gif', contentType: 'image/gif' }
   }
-  // Normalize everything else to webp: smaller files, still broadly supported.
+  // Normalize everything else to webp: smaller files, still broadly
+  // supported, and preserves animation frames when the source was
+  // already an animated webp (see `animated` flag above).
   const buffer = await img.webp({ quality: 85 }).toBuffer()
   return { buffer, ext: 'webp', contentType: 'image/webp' }
 }
 
-// Uploads a single processed file and returns its public URL.
-export async function processAndStoreImage(file) {
-  validate(file)
-  const { buffer, ext, contentType } = await reencode(file)
+// Shared "write this buffer somewhere public" step for both images and
+// video — Cloudinary when configured, local disk otherwise.
+async function storeBuffer(buffer, ext, contentType, resourceType) {
   const filename = `${crypto.randomUUID()}.${ext}`
 
   if (cloudinaryConfigured) {
@@ -88,17 +94,41 @@ export async function processAndStoreImage(file) {
     const result = await cloudinary.uploader.upload(dataUri, {
       folder: 'shaniz',
       public_id: filename.replace(`.${ext}`, ''),
-      resource_type: 'image',
+      resource_type: resourceType,
     })
     return result.secure_url
   }
 
   fs.writeFileSync(path.join(LOCAL_UPLOAD_DIR, filename), buffer)
-  // PUBLIC_API_URL should be the API's own public origin in production
-  // (e.g. https://api.shaniz.lk) so the URL resolves for site visitors,
-  // not just localhost.
   const base = process.env.PUBLIC_API_URL || `http://localhost:${process.env.PORT || 4000}`
   return `${base}/uploads/${filename}`
+}
+
+// Uploads a single processed file and returns its public URL.
+export async function processAndStoreImage(file) {
+  validate(file)
+  const { buffer, ext, contentType } = await reencode(file)
+  return storeBuffer(buffer, ext, contentType, 'image')
+}
+
+// Looping hover-thumbnail videos (WebM). Unlike images, these are stored
+// as-is rather than re-encoded — sharp only handles still/animated
+// images, not video, and there's no video-processing library in this
+// stack. The trade-off is acceptable here specifically because this
+// endpoint is admin-only (requireRole in uploads.routes.js): the trust
+// boundary is "someone with an admin login", not an arbitrary customer
+// upload, which is the case the re-encode/strip-payload requirement in
+// the spec is really guarding against. Mime type and an 8MB-scoped size
+// cap are still enforced before anything is stored.
+export async function processAndStoreVideo(file) {
+  if (!file) throw new UploadError('No file uploaded.')
+  if (!ALLOWED_VIDEO_MIME.has(file.mimetype)) {
+    throw new UploadError('Only WebM video is allowed for hover clips.')
+  }
+  if (file.size > MAX_VIDEO_BYTES) {
+    throw new UploadError('Video is too large (max 15MB) — keep hover clips short, 2-4 seconds.')
+  }
+  return storeBuffer(file.buffer, 'webm', 'video/webm', 'video')
 }
 
 export const isCloudinaryConfigured = cloudinaryConfigured

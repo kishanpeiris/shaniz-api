@@ -33,8 +33,8 @@ async function main() {
 
   const passwordHash = await bcrypt.hash(SUPERADMIN_PASSWORD, 12)
   await client.query(
-    `INSERT INTO users (name, email, password_hash, role, is_primary_superadmin)
-     VALUES ($1, $2, $3, 'superadmin', TRUE)`,
+    `INSERT INTO users (name, email, password_hash, role, is_primary_superadmin, email_verified)
+     VALUES ($1, $2, $3, 'superadmin', TRUE, TRUE)`,
     [SUPERADMIN_NAME, SUPERADMIN_EMAIL, passwordHash]
   )
 
