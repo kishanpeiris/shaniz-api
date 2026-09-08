@@ -160,6 +160,15 @@ CREATE TABLE IF NOT EXISTS products (
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- BUG FIX: the two columns above were only ever inside the CREATE TABLE
+-- statement, which is a no-op on any database where `products` already
+-- existed (CREATE TABLE IF NOT EXISTS skips the whole statement, columns
+-- and all, once the table is present) — so anyone upgrading an existing
+-- deployment never actually got these columns even though `db:migrate`
+-- reported success. Explicit ALTERs below fix that for existing installs;
+-- brand-new installs get them from the CREATE TABLE above either way.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS hover_video_url TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS hover_webp_url TEXT;
 
 -- Sold-out vs pre-order (project-spec addendum): admin picks how an
 -- out-of-stock product behaves. 'in_stock' is the normal case; the other
@@ -175,6 +184,22 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS preorder_eta_days INTEGER CHECK (p
 -- than pointing an index at it, so it can't go stale if photos are
 -- later added, removed, or reordered.
 
+-- ---------------------------------------------------------------------
+-- Branches: physical locations bookable services happen at. A service
+-- without a branch_id (see below) is treated as location-less (e.g. an
+-- at-home service, or simply "not set yet") — the storefront just
+-- doesn't show a location/map for it.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS branches (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name       TEXT NOT NULL,
+  address    TEXT NOT NULL,
+  latitude   DOUBLE PRECISION,
+  longitude  DOUBLE PRECISION,
+  phone      TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS services (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name         TEXT NOT NULL,
@@ -186,10 +211,19 @@ CREATE TABLE IF NOT EXISTS services (
   hover_video_url TEXT, -- same hover treatment as products: video first
   hover_webp_url  TEXT, -- then animated webp
   hover_gif_url   TEXT, -- then legacy gif, then falls back to images[0]
+  branch_id    UUID REFERENCES branches(id) ON DELETE SET NULL,
   is_active    BOOLEAN NOT NULL DEFAULT TRUE,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Kept as explicit ALTERs too, for anyone updating an existing
+-- deployment where the services table was created before hover media
+-- and branches existed (CREATE TABLE IF NOT EXISTS above is a no-op in
+-- that case — see the matching note on the products table above).
+ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_video_url TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_webp_url TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_gif_url TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS branch_id UUID REFERENCES branches(id) ON DELETE SET NULL;
 
 CREATE TABLE IF NOT EXISTS service_availability (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -288,6 +322,13 @@ CREATE TABLE IF NOT EXISTS bookings (
                CHECK (status IN ('confirmed', 'completed', 'cancelled')),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Same issue as products/services above: guest_name and guest_mobile
+-- were only inside this CREATE TABLE, which is a no-op once `bookings`
+-- already exists. Explicit ALTERs so existing deployments actually get
+-- them (guest_email already existed before this pair was added, so it
+-- doesn't need one).
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_name TEXT;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_mobile TEXT;
 
 -- One slot per service can't be double-booked — but a PARTIAL index
 -- (WHERE status != 'cancelled') rather than a plain table constraint, so

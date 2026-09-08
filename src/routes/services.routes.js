@@ -23,9 +23,12 @@ router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const { rows } = await query(
     `SELECT s.id, s.name, s.description, s.price_lkr, s.service_type, s.duration_minutes, s.images,
-            s.hover_video_url, s.hover_webp_url, s.hover_gif_url, s.is_active,
+            s.hover_video_url, s.hover_webp_url, s.hover_gif_url, s.is_active, s.branch_id,
+            b.name AS branch_name, b.address AS branch_address, b.latitude AS branch_latitude,
+            b.longitude AS branch_longitude, b.phone AS branch_phone,
             COALESCE(sold.qty, 0)::int AS units_sold
      FROM services s
+     LEFT JOIN branches b ON b.id = s.branch_id
      ${UNITS_SOLD_SUBQUERY}
      ${isAdmin ? '' : 'WHERE s.is_active = TRUE'}
      ORDER BY s.created_at DESC`
@@ -36,7 +39,13 @@ router.get('/', async (req, res) => {
 // Public detail view — same shape as GET /api/products/:id, used by the
 // new ServiceDetailPage.
 router.get('/:id', async (req, res) => {
-  const { rows } = await query('SELECT * FROM services WHERE id = $1 AND is_active = TRUE', [req.params.id])
+  const { rows } = await query(
+    `SELECT s.*, b.name AS branch_name, b.address AS branch_address, b.latitude AS branch_latitude,
+            b.longitude AS branch_longitude, b.phone AS branch_phone
+     FROM services s LEFT JOIN branches b ON b.id = s.branch_id
+     WHERE s.id = $1 AND s.is_active = TRUE`,
+    [req.params.id]
+  )
   if (!rows[0]) return res.status(404).json({ error: 'Service not found.' })
   res.json({ service: rows[0] })
 })
@@ -53,6 +62,7 @@ const serviceSchema = z.object({
   hover_video_url: z.string().url().optional(),
   hover_webp_url: z.string().url().optional(),
   hover_gif_url: z.string().url().optional(),
+  branch_id: z.string().uuid().nullable().optional(),
   is_active: z.boolean().optional(),
 })
 
@@ -65,8 +75,8 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   }
 
   const { rows } = await query(
-    `INSERT INTO services (name, description, price_lkr, service_type, duration_minutes, images, hover_video_url, hover_webp_url, hover_gif_url)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    `INSERT INTO services (name, description, price_lkr, service_type, duration_minutes, images, hover_video_url, hover_webp_url, hover_gif_url, branch_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
     [
       s.name,
       s.description ?? null,
@@ -77,6 +87,7 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
       s.hover_video_url ?? null,
       s.hover_webp_url ?? null,
       s.hover_gif_url ?? null,
+      s.branch_id ?? null,
     ]
   )
   await logBoth(req.user.id, 'service.created', rows[0].id)
