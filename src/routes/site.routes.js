@@ -1,6 +1,10 @@
 import { Router } from 'express'
+import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { regionsForApi } from '../lib/delivery.js'
+import { sendContactMessageEmail } from '../lib/email.js'
+import { logActivity } from '../lib/log.js'
+import { contactLimiter } from '../middleware/rateLimit.js'
 
 const router = Router()
 
@@ -51,6 +55,39 @@ router.get('/status', async (req, res) => {
 // update pricing, and so the client can't tamper with the fee it sends.
 router.get('/delivery-options', (req, res) => {
   res.json({ regions: regionsForApi() })
+})
+
+// Public: homepage text content (Hero/About/Ritual sections), editable
+// from Admin → Homepage Content. Returns just whatever's been saved —
+// the frontend merges this with its own hardcoded defaults, so a field
+// that's never been touched still shows sensible copy.
+router.get('/homepage-content', async (req, res) => {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'homepage_content'`)
+  res.json({ homepage_content: rows[0]?.value ?? {} })
+})
+
+const contactSchema = z.object({
+  name: z.string().min(1, 'Please enter your name.').max(200),
+  email: z.string().email('Please enter a valid email.'),
+  message: z.string().min(1, 'Please enter a message.').max(4000),
+})
+
+// Public: the homepage "Visit us" contact form (project-spec.md —
+// previously listed under "What's stubbed" as a front-end-only demo).
+// No account/login needed to send a message, so it's rate-limited here
+// specifically (contactLimiter) on top of the general apiLimiter that
+// already applies to all of /api.
+router.post('/contact', contactLimiter, async (req, res) => {
+  const parsed = contactSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'business_info'`)
+  const toEmail = rows[0]?.value?.email || process.env.EMAIL_FROM
+
+  await sendContactMessageEmail(parsed.data, toEmail)
+  await logActivity(null, `contact.message_received (${parsed.data.email})`)
+
+  res.status(201).json({ ok: true })
 })
 
 export default router

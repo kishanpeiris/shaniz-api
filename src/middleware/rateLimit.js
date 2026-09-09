@@ -28,6 +28,17 @@ export const verificationLimiter = rateLimit({
   message: { error: 'Too many verification requests. Try again later.' },
 })
 
+// The homepage contact form (Visit.jsx) — public and unauthenticated,
+// so it needs its own limit distinct from the general apiLimiter to
+// stop it being used to spam the business's inbox.
+export const contactLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many messages sent. Please try again later.' },
+})
+
 // A gentler general limiter for the rest of the API.
 export const apiLimiter = rateLimit({
   windowMs: 60 * 1000,

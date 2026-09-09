@@ -9,6 +9,25 @@ import { createCheckoutSession, GATEWAYS } from '../lib/gateways.js'
 import { deliveryFee, isValidRegion } from '../lib/delivery.js'
 import { evaluateOrderRisk, recordFraudFlags } from '../lib/fraud.js'
 import { getSuperadminEmails } from '../lib/notifications.js'
+import { generateInvoicePdf } from '../lib/pdf.js'
+import { storePdf } from '../lib/uploads.js'
+
+// "What's stubbed" (SETUP-AND-DEPLOYMENT.md 4.1): "PDF invoices — the
+// invoices table and an invoice email exist, but nothing generates an
+// actual PDF file yet." This is that missing piece. Returns the
+// existing invoice's URL if one was already generated for this order
+// (so re-visiting the thank-you page or clicking "Download Invoice"
+// twice doesn't render + upload a fresh PDF every time), otherwise
+// generates one, stores it, and records it in the `invoices` table.
+async function ensureInvoice(order) {
+  const existing = await query('SELECT pdf_url FROM invoices WHERE order_id = $1', [order.id])
+  if (existing.rows[0]?.pdf_url) return existing.rows[0].pdf_url
+
+  const buffer = await generateInvoicePdf(order)
+  const pdfUrl = await storePdf(buffer)
+  await query('INSERT INTO invoices (order_id, pdf_url) VALUES ($1, $2)', [order.id, pdfUrl])
+  return pdfUrl
+}
 
 const router = Router()
 
@@ -305,6 +324,33 @@ router.get('/:id', async (req, res) => {
   res.json({ order })
 })
 
+// On-demand invoice PDF (spec Section 2: "Invoice generation (PDF, auto
+// or on-demand)"). Same ownership rule as GET /:id above — a guest
+// passes ?email=, a logged-in customer just needs to own the order, and
+// admins can pull any order's invoice. Redirects straight to the PDF's
+// URL (Cloudinary or this server's own /uploads) rather than proxying
+// the file through this route.
+router.get('/:id/invoice', async (req, res) => {
+  const { rows } = await query('SELECT * FROM orders WHERE id = $1', [req.params.id])
+  const order = rows[0]
+  if (!order) return res.status(404).json({ error: 'Order not found.' })
+
+  const isOwner = req.user && order.user_id === req.user.id
+  const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
+  const isGuestMatch =
+    !order.user_id && order.guest_email && req.query.email === order.guest_email
+
+  if (!isOwner && !isAdmin && !isGuestMatch) {
+    return res.status(404).json({ error: 'Order not found.' })
+  }
+  if (order.status === 'pending') {
+    return res.status(400).json({ error: 'An invoice is only available once the order is paid.' })
+  }
+
+  const pdfUrl = await ensureInvoice(order)
+  res.redirect(pdfUrl)
+})
+
 // Sandbox payment simulation — stands in for the real gateway's hosted
 // checkout + webhook until you have live credentials (project-spec.md
 // Section 4). Only works while that order's gateway is NOT configured
@@ -364,7 +410,17 @@ router.post('/:id/sandbox-pay', async (req, res) => {
   }
 
   if (mappedStatus === 'paid' && order.customer_email) {
-    await sendInvoiceEmail(updated[0], order.customer_email, null)
+    // A PDF failure (e.g. a transient storage hiccup) should never block
+    // the payment response — the order is already marked paid above.
+    // The invoice can still be generated later, on demand, via
+    // GET /:id/invoice.
+    let pdfUrl = null
+    try {
+      pdfUrl = await ensureInvoice(updated[0])
+    } catch (err) {
+      console.error('Invoice PDF generation failed:', err.message)
+    }
+    await sendInvoiceEmail(updated[0], order.customer_email, pdfUrl)
   }
 
   res.json({ order: updated[0] })
@@ -405,7 +461,15 @@ router.put('/:id/status', requireRole('admin', 'superadmin'), async (req, res) =
   const recipientEmail = order.customer_email ?? (await resolveOrderEmail(order))
   if (recipientEmail) {
     if (order.status === 'shipped') await sendShippingNoticeEmail(order, recipientEmail)
-    if (order.status === 'paid') await sendInvoiceEmail(order, recipientEmail, null)
+    if (order.status === 'paid') {
+      let pdfUrl = null
+      try {
+        pdfUrl = await ensureInvoice(order)
+      } catch (err) {
+        console.error('Invoice PDF generation failed:', err.message)
+      }
+      await sendInvoiceEmail(order, recipientEmail, pdfUrl)
+    }
   }
 
   res.json({ order })

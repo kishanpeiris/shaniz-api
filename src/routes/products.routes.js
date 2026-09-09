@@ -6,9 +6,6 @@ import { logBoth } from '../lib/log.js'
 
 const router = Router()
 
-// Public: browse active products. Admins (identified via the session
-// cookie, same route) also see deactivated ones, since the admin panel
-// needs to manage those too.
 // Units sold per product, from paid-or-further orders only (pending/cancelled
 // carts shouldn't count as "popular"). Orders store line items as a JSONB
 // array rather than a normalized order_items table, so this unnests that
@@ -24,12 +21,24 @@ const UNITS_SOLD_SUBQUERY = `
   ) sold ON sold.product_id = p.id
 `
 
+// Public: browse active products. Inactive/deactivated products are
+// only ever included when explicitly asked for with ?all=true AND the
+// requester is an admin — the admin product-management page passes that
+// flag, everything else (the Shop page, the homepage "Ritual" row,
+// etc.) doesn't. This used to key off "is the requester logged in as an
+// admin at all", which meant an admin browsing their own storefront
+// while signed in would silently see deactivated products mixed into
+// the public catalog — the exact "deactivated items still show up on
+// the shop" bug this fixes.
 router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
+  const includeInactive = isAdmin && req.query.all === 'true'
   const { rows } = await query(
-    `SELECT p.id, p.name, p.description, p.price_lkr, p.stock_qty, p.category, p.images,
-            p.hover_gif_url, p.hover_video_url, p.hover_webp_url, p.is_active,
-            p.availability_mode, p.preorder_eta_days,
+    `SELECT p.id, p.name, p.description, p.price_lkr, p.stock_qty, p.category, p.category_id,
+            c.name AS category_name, c.parent_id AS category_parent_id, p.badges, p.images,
+            p.hover_gif_url, p.hover_video_url, p.hover_webp_url, p.detail_video_url, p.is_active,
+            p.image_focal_x, p.image_focal_y,
+            p.availability_mode, p.preorder_eta_days, p.created_at,
             (p.stock_qty = 0) AS out_of_stock,
             CASE
               WHEN p.stock_qty > 0 THEN 'in_stock'
@@ -38,26 +47,33 @@ router.get('/', async (req, res) => {
             END AS availability,
             COALESCE(sold.qty, 0)::int AS units_sold
      FROM products p
+     LEFT JOIN categories c ON c.id = p.category_id
      ${UNITS_SOLD_SUBQUERY}
-     ${isAdmin ? '' : 'WHERE p.is_active = TRUE'}
+     ${includeInactive ? '' : 'WHERE p.is_active = TRUE'}
      ORDER BY p.created_at DESC`
   )
-  res.json({ products: rows })
+  // category: resolved display name — a real category's name if one is
+  // set, otherwise whatever legacy free-text value the product already
+  // had (see the migration note on the categories table in schema.sql).
+  res.json({ products: rows.map((r) => ({ ...r, category: r.category_name || r.category })) })
 })
 
 router.get('/:id', async (req, res) => {
+  const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const { rows } = await query(
-    `SELECT *,
+    `SELECT p.*, c.name AS category_name, c.parent_id AS category_parent_id,
             CASE
-              WHEN stock_qty > 0 THEN 'in_stock'
-              WHEN availability_mode = 'preorder' THEN 'preorder'
+              WHEN p.stock_qty > 0 THEN 'in_stock'
+              WHEN p.availability_mode = 'preorder' THEN 'preorder'
               ELSE 'out_of_stock'
             END AS availability
-     FROM products WHERE id = $1 AND is_active = TRUE`,
+     FROM products p LEFT JOIN categories c ON c.id = p.category_id
+     WHERE p.id = $1 ${isAdmin ? '' : 'AND p.is_active = TRUE'}`,
     [req.params.id]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Product not found.' })
-  res.json({ product: rows[0] })
+  const row = rows[0]
+  res.json({ product: { ...row, category: row.category_name || row.category } })
 })
 
 const productSchema = z.object({
@@ -66,6 +82,8 @@ const productSchema = z.object({
   price_lkr: z.number().nonnegative(),
   stock_qty: z.number().int().nonnegative().default(0),
   category: z.string().optional(),
+  category_id: z.string().uuid().nullable().optional(),
+  badges: z.array(z.string().min(1).max(40)).max(6).optional(),
   images: z.array(z.string().url()).optional(),
   hover_gif_url: z.string().url().optional(),
   // Preferred over hover_gif_url going forward: hover_video_url is tried
@@ -74,6 +92,12 @@ const productSchema = z.object({
   // hover effect without needing a re-upload).
   hover_video_url: z.string().url().optional(),
   hover_webp_url: z.string().url().optional(),
+  // A separate, longer clip meant for the product detail page's media
+  // gallery (not the hover loop) — shown alongside the photos there,
+  // with the same prev/next navigation.
+  detail_video_url: z.string().url().nullable().optional(),
+  image_focal_x: z.number().min(0).max(100).optional(),
+  image_focal_y: z.number().min(0).max(100).optional(),
   is_active: z.boolean().optional(),
   availability_mode: z.enum(['in_stock', 'out_of_stock', 'preorder']).optional(),
   preorder_eta_days: z.number().int().positive().nullable().optional(),
@@ -87,18 +111,21 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const p = parsed.data
 
   const { rows } = await query(
-    `INSERT INTO products (name, description, price_lkr, stock_qty, category, images, hover_gif_url, hover_video_url, hover_webp_url, availability_mode, preorder_eta_days)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+    `INSERT INTO products (name, description, price_lkr, stock_qty, category, category_id, badges, images, hover_gif_url, hover_video_url, hover_webp_url, detail_video_url, availability_mode, preorder_eta_days)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
     [
       p.name,
       p.description ?? null,
       p.price_lkr,
       p.stock_qty,
       p.category ?? null,
+      p.category_id ?? null,
+      p.badges ?? [],
       p.images ?? [],
       p.hover_gif_url ?? null,
       p.hover_video_url ?? null,
       p.hover_webp_url ?? null,
+      p.detail_video_url ?? null,
       p.availability_mode ?? 'in_stock',
       p.preorder_eta_days ?? null,
     ]
@@ -125,9 +152,29 @@ router.put('/:id', requireRole('admin', 'superadmin'), async (req, res) => {
   res.json({ product: rows[0] })
 })
 
+// Soft delete (deactivate) — hides the product from the storefront but
+// keeps it (and its order history) intact. This is still the default
+// "Delete" action in the admin UI's main list.
 router.delete('/:id', requireRole('admin', 'superadmin'), async (req, res) => {
   await query('UPDATE products SET is_active = FALSE WHERE id = $1', [req.params.id])
   await logBoth(req.user.id, 'product.deactivated', req.params.id)
+  res.json({ ok: true })
+})
+
+// True, permanent delete. Only allowed once a product is already
+// deactivated — a deliberate two-step "deactivate, then delete" flow so
+// a live product can't be destroyed with a single misclick. Safe to
+// hard-delete at the database level: order line items are stored as a
+// JSONB snapshot (name/qty/price at time of purchase), not a foreign key
+// to this table, so removing a product row never breaks past orders.
+router.delete('/:id/permanent', requireRole('admin', 'superadmin'), async (req, res) => {
+  const { rows } = await query('SELECT is_active FROM products WHERE id = $1', [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Product not found.' })
+  if (rows[0].is_active) {
+    return res.status(400).json({ error: 'Deactivate this product first, then permanently delete it.' })
+  }
+  await query('DELETE FROM products WHERE id = $1', [req.params.id])
+  await logBoth(req.user.id, 'product.deleted', req.params.id)
   res.json({ ok: true })
 })
 

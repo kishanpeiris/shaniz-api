@@ -170,6 +170,43 @@ CREATE TABLE IF NOT EXISTS products (
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hover_video_url TEXT;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hover_webp_url TEXT;
 
+-- Admin-manageable categories with optional one-level subcategories
+-- (parent_id). Shared table for both products and services, scoped by
+-- `kind` — a "Hair Care" product category and a "Hair Care" service
+-- category are deliberately separate rows, since what makes sense to
+-- group together differs between the two. The old free-text
+-- products.category / services.category columns are kept exactly as
+-- they were (nothing migrated automatically) — new/edited items get a
+-- real category_id, and API responses resolve the display name as
+-- COALESCE(categories.name, <legacy text column>) so existing catalog
+-- data keeps working without a manual migration step.
+CREATE TABLE IF NOT EXISTS categories (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind       TEXT NOT NULL CHECK (kind IN ('product', 'service')),
+  name       TEXT NOT NULL,
+  parent_id  UUID REFERENCES categories(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_categories_kind ON categories (kind);
+CREATE INDEX IF NOT EXISTS idx_categories_parent ON categories (parent_id);
+
+ALTER TABLE products ADD COLUMN IF NOT EXISTS category_id UUID REFERENCES categories(id) ON DELETE SET NULL;
+
+-- Special banners ("100% Natural", "New Arrival", ...) — a free-form
+-- list of short labels per product/service rather than a fixed enum, so
+-- an admin can type a brand-new one at any time without a code change.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS badges TEXT[] DEFAULT '{}';
+
+-- A longer clip for the product/service detail page's media gallery —
+-- distinct from hover_video_url (a short muted loop for the Shop grid
+-- card). Shown alongside the photos in the gallery with the same
+-- prev/next navigation and a maximize/lightbox view.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS detail_video_url TEXT;
+-- (The matching services.category_id / badges / detail_video_url columns
+-- are added further down, right after CREATE TABLE services — adding
+-- them here would fail, since the services table doesn't exist yet at
+-- this point in the file.)
+
 -- Sold-out vs pre-order (project-spec addendum): admin picks how an
 -- out-of-stock product behaves. 'in_stock' is the normal case; the other
 -- two only matter once stock_qty hits 0. preorder_eta_days is a rolling
@@ -224,6 +261,24 @@ ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_video_url TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_webp_url TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_gif_url TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS branch_id UUID REFERENCES branches(id) ON DELETE SET NULL;
+-- Same three additions as products above (categories table already
+-- exists by this point in the file, so this is safe here).
+ALTER TABLE services ADD COLUMN IF NOT EXISTS category_id UUID REFERENCES categories(id) ON DELETE SET NULL;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS badges TEXT[] DEFAULT '{}';
+ALTER TABLE services ADD COLUMN IF NOT EXISTS detail_video_url TEXT;
+
+-- A lightweight, non-destructive answer to "the thumbnail crop is cutting
+-- off the wrong part of the photo": rather than force a specific crop at
+-- upload time (which would permanently discard part of the original
+-- photo), the admin picks a focal point on the *existing* main photo —
+-- CSS object-position, applied wherever that photo is shown in a
+-- square/cropped box (Shop grid, product detail page). Defaults to dead
+-- center (50, 50), which is exactly today's behavior, so nothing changes
+-- for a product until someone deliberately adjusts it.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS image_focal_x REAL NOT NULL DEFAULT 50;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS image_focal_y REAL NOT NULL DEFAULT 50;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS image_focal_x REAL NOT NULL DEFAULT 50;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS image_focal_y REAL NOT NULL DEFAULT 50;
 
 CREATE TABLE IF NOT EXISTS service_availability (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -418,6 +473,30 @@ INSERT INTO site_settings (key, value) VALUES ('business_info', '{
   "email": "hello@shaniz.lk",
   "address": "Colombo, Sri Lanka",
   "facebook_url": "https://www.facebook.com/share/r/18w79k89Zo/"
+}')
+  ON CONFLICT (key) DO NOTHING;
+
+-- Basic CMS (spec Section 2: "Page customization UI — edit homepage
+-- banners/sections without touching code"). Deliberately scoped to the
+-- text content of the three main homepage sections (Hero, About, the
+-- Ritual/shop intro) rather than a full drag-and-drop layout builder —
+-- that would be a much larger, more fragile undertaking for a site this
+-- size. Images/hover-media are already editable via the Products/
+-- Services admin pages. Seeded with the exact current hardcoded copy,
+-- so nothing on the live site changes until an admin actually edits it.
+INSERT INTO site_settings (key, value) VALUES ('homepage_content', '{
+  "hero_eyebrow": "Small-batch · Sri Lankan grown",
+  "hero_headline": "Ceylon''s herbal ritual, bottled by hand.",
+  "hero_subtext": "Amla, curry leaf, neem and rosemary — blended the way our grandmothers did, for hair that remembers what it''s like to be cared for.",
+  "hero_cta1_label": "Shop the Ritual",
+  "hero_cta2_label": "Watch It Being Made",
+  "about_eyebrow": "Our story",
+  "about_headline": "Rooted in the same soil\nas ayurveda itself.",
+  "about_paragraph1": "Shani''z started at a kitchen table, boiling curry leaf and rosemary the way it had been done in our family for three generations — not as a trend, but as a habit of care. Every batch is still small enough to stir by hand, so the herbs stay whole and the oils stay honest.",
+  "about_paragraph2": "We don''t chase long ingredient lists. We chase the ones that work: amla for strength, neem for the scalp, curry leaf for shine, rosemary for growth. Nothing else needs to be in the jar.",
+  "ritual_eyebrow": "The Ritual",
+  "ritual_headline": "Shop what''s in the jar.",
+  "ritual_subtext": "Two staples to start with — an oil for the scalp, a mask for the strands. Hover a product to see what''s inside."
 }')
   ON CONFLICT (key) DO NOTHING;
 

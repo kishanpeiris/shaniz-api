@@ -5,6 +5,8 @@ import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
 import { generateProductDescription } from '../lib/ai.js'
+import { sendNewAdminAlertEmail } from '../lib/email.js'
+import { getSuperadminEmails } from '../lib/notifications.js'
 
 const router = Router()
 
@@ -276,8 +278,21 @@ router.post('/admins', requireRole('superadmin'), async (req, res) => {
     [name, email, passwordHash, role]
   )
   await logBoth(req.user.id, 'admin.created', rows[0].id, { role })
-  // Spec Section 7 monitoring: alert the super admin when a new admin account is created.
-  // TODO: send that alert email here (Resend/SendGrid).
+
+  // Spec Section 7 monitoring: alert the super admin when a new admin
+  // account is created. Sent outside any transaction (there isn't one
+  // here) and never allowed to fail the request — the account is
+  // already created at this point, an email hiccup shouldn't undo that
+  // or block the response.
+  try {
+    const superadminEmails = await getSuperadminEmails()
+    await Promise.all(
+      superadminEmails.map((email) => sendNewAdminAlertEmail(rows[0], req.user.name, email))
+    )
+  } catch (err) {
+    console.error('New-admin alert email failed:', err.message)
+  }
+
   res.status(201).json({ admin: rows[0] })
 })
 
@@ -327,6 +342,60 @@ router.put('/settings/business-info', async (req, res) => {
   )
   await logBoth(req.user.id, 'settings.business_info_updated', null, parsed.data)
   res.json({ business_info: merged })
+})
+
+// ---- Homepage content (basic CMS — Section 2's "Page customization UI") ----
+// Same "safe, low-risk fields only" reasoning as business info above:
+// this is marketing copy, not anything security-sensitive.
+const homepageContentSchema = z.object({
+  hero_eyebrow: z.string().max(120).optional(),
+  hero_headline: z.string().max(300).optional(),
+  hero_subtext: z.string().max(500).optional(),
+  hero_cta1_label: z.string().max(60).optional(),
+  hero_cta2_label: z.string().max(60).optional(),
+  // Empty string is a valid value here (it means "clear the override,
+  // go back to the bundled default image/video" — see the frontend's
+  // fallback logic in Hero.jsx/About.jsx/Products.jsx), so these accept
+  // '' as well as a real uploaded URL, unlike a plain z.string().url().
+  hero_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  hero_video_url: z.union([z.string().url(), z.literal('')]).optional(),
+  about_eyebrow: z.string().max(120).optional(),
+  about_headline: z.string().max(300).optional(),
+  about_paragraph1: z.string().max(1000).optional(),
+  about_paragraph2: z.string().max(1000).optional(),
+  about_image_url: z.union([z.string().url(), z.literal('')]).optional(),
+  about_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  ritual_eyebrow: z.string().max(120).optional(),
+  ritual_headline: z.string().max(300).optional(),
+  ritual_subtext: z.string().max(500).optional(),
+  ritual_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  // Up to 9 process-video URLs (shown 3 at a time on the homepage, with
+  // paging arrows past that — see RowCarousel.jsx). Capped server-side
+  // too, not just in the admin UI, since this is a public-facing
+  // section and an unbounded array here would be an easy way to bloat
+  // site_settings.
+  see_it_made_videos: z.array(z.string().url()).max(9).optional(),
+})
+
+router.get('/settings/homepage-content', async (req, res) => {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'homepage_content'`)
+  res.json({ homepage_content: rows[0]?.value ?? {} })
+})
+
+router.put('/settings/homepage-content', async (req, res) => {
+  const parsed = homepageContentSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  const current = await query(`SELECT value FROM site_settings WHERE key = 'homepage_content'`)
+  const merged = { ...(current.rows[0]?.value ?? {}), ...parsed.data }
+
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('homepage_content', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [JSON.stringify(merged)]
+  )
+  await logBoth(req.user.id, 'settings.homepage_content_updated', null, parsed.data)
+  res.json({ homepage_content: merged })
 })
 
 // ---- Maintenance mode & outage calendar (Section 10) ----

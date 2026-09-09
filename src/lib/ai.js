@@ -25,17 +25,21 @@
 
 const MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest'
 
-const SYSTEM_PROMPT = `You write short product descriptions for Shani'z, a Sri Lankan herbal/ayurvedic hair and skin care brand. Tone: warm, grounded, ingredient-forward — like someone who actually uses these products explaining why they like them, not a marketing department.
+const SYSTEM_PROMPT = `You write product descriptions for Shani'z, a Sri Lankan herbal/ayurvedic hair and skin care brand. Tone: warm, grounded, ingredient-forward — like someone who actually uses these products explaining why they like them, not a marketing department.
+
+Format the output in this lightweight structure (rendered as simple rich text on the site, so stick to exactly this):
+- Start with 1-2 short sentences of plain intro text (no heading needed for this part).
+- Then a line "### Why you'll like it" followed by 2-4 bullet points ("- " at the start of each line), each one short benefit or ingredient callout, one idea per line.
+- Nothing after the bullets — no closing summary line.
 
 Hard rules:
-- 2-4 sentences. No headers, no bullet points, no emoji.
+- No emoji.
 - Never use "unlock", "elevate", "indulge", "seamless", "journey", "in today's world", "look no further", or similar stock marketing phrases.
 - Do not use a "not just X, it's Y" or "more than X, it's Y" contrast structure.
-- Do not end with a punchy one-line summary sentence as a closer.
 - Vary sentence length naturally. Don't stack three adjectives in a row.
 - Mention specific ingredients or effects the admin gave you — don't invent ingredients that weren't mentioned.
-- If the admin gave you very little to work with, write something modest and honest rather than padding with generic claims.
-- Output ONLY the description text. No preamble, no quotation marks around it.`
+- If the admin gave you very little to work with, write something modest and honest rather than padding with generic claims — it's fine for the bullet list to be shorter (even just 2 points) rather than inventing filler.
+- Output ONLY the description text in the format above. No preamble, no quotation marks around it.`
 
 export async function generateProductDescription({ name, category, hint }) {
   const apiKey = process.env.GEMINI_API_KEY
@@ -66,7 +70,18 @@ export async function generateProductDescription({ name, category, hint }) {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents: [{ parts: [{ text: userMessage }] }],
-        generationConfig: { maxOutputTokens: 300 },
+        // Newer Gemini Flash models spend part of this budget on an
+        // internal "thinking" pass before writing the visible answer —
+        // with a small maxOutputTokens (this used to be 300), that
+        // thinking could eat almost the whole budget and leave the
+        // actual description cut off mid-sentence (exactly what showed
+        // up in testing). thinkingBudget: 0 turns that off entirely for
+        // this simple, non-reasoning task, and the larger token cap is
+        // a safety margin on top of that, not a requirement.
+        generationConfig: {
+          maxOutputTokens: 1024,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
       }),
     }
   )

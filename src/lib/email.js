@@ -144,6 +144,43 @@ export async function sendFraudAlertEmail(order, flags, toEmail) {
   return send({ to: toEmail, subject: `⚠ Order flagged for review — ${order.id.slice(0, 8)}`, html })
 }
 
+// Spec Section 7 monitoring: "Alert (email) to super admin on ... new
+// admin account created." toEmail is one superadmin's address — the
+// caller (admin.routes.js) sends one of these per active superadmin,
+// same pattern as sendFraudAlertEmail.
+export async function sendNewAdminAlertEmail(newAdmin, actorName, toEmail) {
+  const html = layout(
+    'New Admin Account Created',
+    `
+      <p><strong>${actorName}</strong> just created a new ${newAdmin.role} account:</p>
+      <ul>
+        <li>Name: ${newAdmin.name}</li>
+        <li>Email: ${newAdmin.email}</li>
+        <li>Role: ${newAdmin.role}</li>
+      </ul>
+      <p style="font-size:13px; color:#5c5949;">If this wasn't you or expected, review it from Admin → Admins and the audit log right away.</p>
+    `
+  )
+  return send({ to: toEmail, subject: `New ${newAdmin.role} account created — ${newAdmin.email}`, html })
+}
+
+// The homepage "Visit us" contact form (project-spec.md "Contact form —
+// still a placeholder"). No customer-facing confirmation email is sent
+// here — just notifying the business. name/email/message are already
+// validated (length + shape) by the zod schema in site.routes.js before
+// this is called; still escaped-free since this is an internal email,
+// not rendered back to any visitor.
+export async function sendContactMessageEmail({ name, email, message }, toEmail) {
+  const html = layout(
+    'New Contact Form Message',
+    `
+      <p><strong>From:</strong> ${name} (${email})</p>
+      <p style="white-space: pre-wrap;">${message}</p>
+    `
+  )
+  return send({ to: toEmail, subject: `Website message from ${name}`, html })
+}
+
 export async function sendInvoiceEmail(order, toEmail, pdfUrl) {
   const html = layout(
     'Your Invoice',

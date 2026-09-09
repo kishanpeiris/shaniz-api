@@ -22,6 +22,7 @@ import { startLogPurgeJob } from './lib/logPurge.js'
 import authRoutes from './routes/auth.routes.js'
 import productRoutes from './routes/products.routes.js'
 import serviceRoutes from './routes/services.routes.js'
+import categoryRoutes from './routes/categories.routes.js'
 import branchRoutes from './routes/branches.routes.js'
 import bookingRoutes from './routes/bookings.routes.js'
 import orderRoutes from './routes/orders.routes.js'
@@ -82,6 +83,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }))
 app.use('/api/auth', authRoutes)
 app.use('/api/products', productRoutes)
 app.use('/api/services', serviceRoutes)
+app.use('/api/categories', categoryRoutes)
 app.use('/api/branches', branchRoutes)
 app.use('/api/bookings', bookingRoutes)
 app.use('/api/orders', orderRoutes)
