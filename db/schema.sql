@@ -35,6 +35,12 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS mobile TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+-- 'en' (English, default), 'si' (Sinhala), or 'ta' (Tamil). Applied on
+-- login/register and readable from Account settings; guests (not
+-- logged in) get their language choice remembered in the browser only
+-- (see LanguageContext.jsx on the frontend).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS language_pref TEXT NOT NULL DEFAULT 'en'
+  CHECK (language_pref IN ('en', 'si', 'ta'));
 
 -- Defense in depth alongside app-level lowercasing on register/login/
 -- forgot-password: guarantees "a@x.com" and "A@X.com" can never both

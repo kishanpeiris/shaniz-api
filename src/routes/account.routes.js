@@ -15,7 +15,7 @@ router.use(requireAuth)
 // ---- Profile ----
 router.get('/profile', async (req, res) => {
   const { rows } = await query(
-    `SELECT id, name, first_name, last_name, email, mobile, role, email_verified, disabled, created_at
+    `SELECT id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at
      FROM users WHERE id = $1`,
     [req.user.id]
   )
@@ -40,7 +40,7 @@ router.put('/profile', async (req, res) => {
   const { rows } = await query(
     `UPDATE users SET name = $1, first_name = $2, last_name = $3, mobile = $4
      WHERE id = $5
-     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, disabled, created_at`,
+     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at`,
     [name, firstName, lastName || null, mobile || null, req.user.id]
   )
   await logActivity(req.user.id, 'account.profile_updated')
@@ -56,6 +56,20 @@ const changePasswordSchema = z.object({
     .min(10, 'Password must be at least 10 characters.')
     .regex(/[A-Z]/, 'Password needs at least one uppercase letter.')
     .regex(/[0-9]/, 'Password needs at least one number.'),
+})
+
+// Language preference — a customer's own choice for the storefront
+// (English by default, or Sinhala/Tamil). Kept as its own tiny endpoint
+// rather than folded into PUT /profile since it has nothing to do with
+// name/mobile and shouldn't require re-sending those every time someone
+// just wants to switch languages.
+router.put('/language', async (req, res) => {
+  const parsed = z.object({ languagePref: z.enum(['en', 'si', 'ta']) }).safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'languagePref must be en, si, or ta.' })
+
+  await query('UPDATE users SET language_pref = $1 WHERE id = $2', [parsed.data.languagePref, req.user.id])
+  await logActivity(req.user.id, 'account.language_updated')
+  res.json({ languagePref: parsed.data.languagePref })
 })
 
 router.put('/password', async (req, res) => {

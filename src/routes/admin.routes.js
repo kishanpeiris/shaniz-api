@@ -321,6 +321,11 @@ const businessInfoSchema = z.object({
   email: z.string().email().optional(),
   address: z.string().max(300).optional(),
   facebook_url: z.string().url().optional(),
+  // Digits only, with country code, no + or spaces (e.g. "94771234567")
+  // — that's the exact format wa.me links need. Validated loosely here;
+  // the frontend strips non-digits before saving so a pasted "+94 77
+  // 123 4567" still works.
+  whatsapp_number: z.string().regex(/^\d{7,15}$/, 'Use digits only, with country code (e.g. 94771234567).').optional().or(z.literal('')),
 })
 
 router.get('/settings/business-info', async (req, res) => {

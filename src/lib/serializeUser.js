@@ -18,6 +18,7 @@ export function serializeUser(row) {
     mobile: row.mobile ?? null,
     role: row.role,
     emailVerified: Boolean(row.email_verified),
+    languagePref: row.language_pref || 'en',
     disabled: Boolean(row.disabled),
     createdAt: row.created_at ?? null,
   }

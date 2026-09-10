@@ -11,7 +11,7 @@ export async function attachUser(req, res, next) {
   try {
     const payload = verifySession(token)
     const { rows } = await query(
-      `SELECT id, name, first_name, last_name, email, mobile, role, disabled, email_verified, created_at
+      `SELECT id, name, first_name, last_name, email, mobile, role, disabled, email_verified, language_pref, created_at
        FROM users WHERE id = $1`,
       [payload.sub]
     )
