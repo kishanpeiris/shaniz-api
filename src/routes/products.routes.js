@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
+import { maybeSendLowStockAlert } from '../lib/lowStockAlert.js'
 
 const router = Router()
 
@@ -83,7 +84,11 @@ const productSchema = z.object({
   stock_qty: z.number().int().nonnegative().default(0),
   category: z.string().optional(),
   category_id: z.string().uuid().nullable().optional(),
-  badges: z.array(z.string().min(1).max(40)).max(6).optional(),
+  // No upper limit here (was previously capped at 6) — BadgesInput.jsx
+  // on the frontend has no cap either, and this must match or a 7th+
+  // banner would silently fail to save with a validation error. Each
+  // individual banner still can't be absurdly long (max 40 chars).
+  badges: z.array(z.string().min(1).max(40)).optional(),
   images: z.array(z.string().url()).optional(),
   hover_gif_url: z.string().url().optional(),
   // Preferred over hover_gif_url going forward: hover_video_url is tried
@@ -184,6 +189,12 @@ router.post('/:id/stock', requireRole('admin', 'superadmin'), async (req, res) =
   const delta = z.number().int().safeParse(req.body?.delta)
   if (!delta.success) return res.status(400).json({ error: 'delta must be an integer.' })
 
+  // Needed before the UPDATE so the low-stock alert can tell whether
+  // this adjustment CROSSED into low stock, versus it already being low
+  // (see lib/lowStockAlert.js — the latter shouldn't re-send an email).
+  const before = await query('SELECT name, stock_qty FROM products WHERE id = $1', [req.params.id])
+  if (!before.rows[0]) return res.status(404).json({ error: 'Product not found.' })
+
   const { rows } = await query(
     `UPDATE products SET stock_qty = GREATEST(stock_qty + $1, 0), updated_at = now()
      WHERE id = $2 RETURNING id, stock_qty, low_stock_threshold`,
@@ -196,6 +207,17 @@ router.post('/:id/stock', requireRole('admin', 'superadmin'), async (req, res) =
     product: rows[0],
     low_stock: rows[0].stock_qty <= rows[0].low_stock_threshold,
   })
+
+  // Fire-and-forget, after the response — a slow/failed email should
+  // never delay or break the actual stock update the admin is waiting
+  // on.
+  maybeSendLowStockAlert({
+    id: rows[0].id,
+    name: before.rows[0].name,
+    previousQty: before.rows[0].stock_qty,
+    newQty: rows[0].stock_qty,
+    threshold: rows[0].low_stock_threshold,
+  }).catch((err) => console.error('[low-stock-alert] failed:', err.message))
 })
 
 export default router

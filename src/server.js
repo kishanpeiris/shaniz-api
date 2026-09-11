@@ -18,6 +18,7 @@ import { attachUser, requireRole } from './middleware/auth.js'
 import { requireCsrfHeader } from './middleware/csrf.js'
 import { apiLimiter } from './middleware/rateLimit.js'
 import { startLogPurgeJob } from './lib/logPurge.js'
+import { startBookingReminderJob } from './lib/bookingReminders.js'
 
 import authRoutes from './routes/auth.routes.js'
 import productRoutes from './routes/products.routes.js'
@@ -102,4 +103,5 @@ const port = process.env.PORT || 4000
 app.listen(port, () => {
   console.log(`Shani'z API listening on http://localhost:${port}`)
   startLogPurgeJob()
+  startBookingReminderJob()
 })

@@ -64,7 +64,9 @@ const serviceSchema = z.object({
   service_type: z.enum(['bookable', 'purchasable']),
   duration_minutes: z.number().int().positive().optional(),
   category_id: z.string().uuid().nullable().optional(),
-  badges: z.array(z.string().min(1).max(40)).max(6).optional(),
+  // No upper limit here (was previously capped at 6) — see the matching
+  // comment in products.routes.js.
+  badges: z.array(z.string().min(1).max(40)).optional(),
   images: z.array(z.string().url()).optional(),
   // Same hover-preference order as products: video, then webp, then the
   // legacy gif field, then just the first image in `images`.

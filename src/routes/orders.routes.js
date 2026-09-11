@@ -9,6 +9,7 @@ import { createCheckoutSession, GATEWAYS } from '../lib/gateways.js'
 import { deliveryFee, isValidRegion } from '../lib/delivery.js'
 import { evaluateOrderRisk, recordFraudFlags } from '../lib/fraud.js'
 import { getSuperadminEmails } from '../lib/notifications.js'
+import { maybeSendLowStockAlert } from '../lib/lowStockAlert.js'
 import { generateInvoicePdf } from '../lib/pdf.js'
 import { storePdf } from '../lib/uploads.js'
 
@@ -133,13 +134,14 @@ router.post('/', async (req, res) => {
     await client.query('BEGIN')
 
     const resolvedItems = []
+    const stockCrossingChecks = [] // resolved after COMMIT — see below
     let subtotal = 0
 
     for (const item of d.items) {
       const table = item.type === 'product' ? 'products' : 'services'
       const { rows } = await client.query(
         `SELECT id, name, price_lkr${
-          item.type === 'product' ? ', stock_qty, availability_mode, preorder_eta_days' : ''
+          item.type === 'product' ? ', stock_qty, low_stock_threshold, availability_mode, preorder_eta_days' : ''
         } FROM ${table} WHERE id = $1 AND is_active = TRUE FOR UPDATE`,
         [item.id]
       )
@@ -169,6 +171,13 @@ router.post('/', async (req, res) => {
             item.qty,
             item.id,
           ])
+          stockCrossingChecks.push({
+            id: record.id,
+            name: record.name,
+            previousQty: record.stock_qty,
+            newQty: record.stock_qty - item.qty,
+            threshold: record.low_stock_threshold,
+          })
         }
       }
 
@@ -274,6 +283,14 @@ router.post('/', async (req, res) => {
       await Promise.all(superadminEmails.map((email) => sendFraudAlertEmail(order, fraudFlags, email)))
       await logAudit(null, 'fraud.flagged', order.id, { codes: fraudFlags.map((f) => f.code) })
     }
+
+    // Same "outside the transaction, never blocks the order" reasoning
+    // as the fraud alert above — and maybeSendLowStockAlert itself only
+    // actually emails on a genuine crossing (see lib/lowStockAlert.js),
+    // so most orders call this and it silently does nothing.
+    await Promise.all(stockCrossingChecks.map((c) => maybeSendLowStockAlert(c))).catch((err) =>
+      console.error('[low-stock-alert] failed:', err.message)
+    )
 
     // Once KOKO_/INTPAY_/DIALOG_GENIE_ env vars are set (project-spec.md
     // Section 4), this calls the real gateway; until then it returns a

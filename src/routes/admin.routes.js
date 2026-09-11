@@ -7,6 +7,7 @@ import { logBoth } from '../lib/log.js'
 import { generateProductDescription } from '../lib/ai.js'
 import { sendNewAdminAlertEmail } from '../lib/email.js'
 import { getSuperadminEmails } from '../lib/notifications.js'
+import { toCsv } from '../lib/csv.js'
 
 const router = Router()
 
@@ -159,6 +160,88 @@ router.get('/customers', async (req, res) => {
      ORDER BY u.created_at DESC LIMIT 500`
   )
   res.json({ customers: rows })
+})
+
+// ---- CSV export (accounting/tax records, backups, spreadsheets) ----
+// Deliberately no LIMIT here (unlike the paginated /orders and
+// /customers listing endpoints above) — an export is supposed to be
+// everything, not just the most recent page. Sent as a real file
+// download (Content-Disposition: attachment) rather than JSON, so
+// clicking the link in the admin panel just saves a .csv straight away.
+router.get('/export/orders.csv', async (req, res) => {
+  const { rows } = await query(`SELECT * FROM orders ORDER BY created_at DESC`)
+
+  const csv = toCsv(rows, [
+    { header: 'Order ID', get: (o) => o.id },
+    { header: 'Date', get: (o) => new Date(o.created_at).toISOString() },
+    { header: 'Status', get: (o) => o.status },
+    { header: 'Customer Name', get: (o) => [o.customer_first_name, o.customer_last_name].filter(Boolean).join(' ') },
+    { header: 'Customer Email', get: (o) => o.customer_email ?? o.guest_email },
+    { header: 'Customer Phone', get: (o) => o.customer_phone },
+    {
+      header: 'Items',
+      get: (o) => (Array.isArray(o.items) ? o.items.map((i) => `${i.name} x${i.qty}`).join('; ') : ''),
+    },
+    { header: 'Total (LKR)', get: (o) => o.total_lkr },
+    { header: 'Delivery Fee (LKR)', get: (o) => o.delivery_fee_lkr },
+    { header: 'Delivery Method', get: (o) => o.delivery_method },
+    { header: 'Delivery Region', get: (o) => o.delivery_region },
+    { header: 'Payment Gateway', get: (o) => o.gateway_used },
+    { header: 'Payment Reference', get: (o) => o.gateway_txn_id },
+    {
+      header: 'Shipping Address',
+      get: (o) => {
+        const a = o.shipping_address
+        if (!a) return ''
+        return [a.line1, a.city, a.postal_code].filter(Boolean).join(', ')
+      },
+    },
+  ])
+
+  await logBoth(req.user.id, 'export.orders_csv', null, { row_count: rows.length })
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="orders-${new Date().toISOString().slice(0, 10)}.csv"`)
+  res.send(csv)
+})
+
+router.get('/export/customers.csv', async (req, res) => {
+  const { rows } = await query(
+    `SELECT
+       u.id, u.name, u.first_name, u.last_name, u.email, u.mobile,
+       u.email_verified, u.disabled, u.created_at,
+       COALESCE(o.order_count, 0) AS order_count,
+       COALESCE(o.total_spent_lkr, 0) AS total_spent_lkr,
+       COALESCE(b.booking_count, 0) AS booking_count
+     FROM users u
+     LEFT JOIN (
+       SELECT user_id, COUNT(*) AS order_count, SUM(total_lkr) AS total_spent_lkr
+       FROM orders WHERE user_id IS NOT NULL GROUP BY user_id
+     ) o ON o.user_id = u.id
+     LEFT JOIN (
+       SELECT user_id, COUNT(*) AS booking_count
+       FROM bookings WHERE user_id IS NOT NULL GROUP BY user_id
+     ) b ON b.user_id = u.id
+     WHERE u.role = 'customer'
+     ORDER BY u.created_at DESC`
+  )
+
+  const csv = toCsv(rows, [
+    { header: 'Customer ID', get: (c) => c.id },
+    { header: 'Name', get: (c) => c.name ?? [c.first_name, c.last_name].filter(Boolean).join(' ') },
+    { header: 'Email', get: (c) => c.email },
+    { header: 'Mobile', get: (c) => c.mobile },
+    { header: 'Email Verified', get: (c) => (c.email_verified ? 'Yes' : 'No') },
+    { header: 'Disabled', get: (c) => (c.disabled ? 'Yes' : 'No') },
+    { header: 'Joined', get: (c) => new Date(c.created_at).toISOString() },
+    { header: 'Order Count', get: (c) => c.order_count },
+    { header: 'Total Spent (LKR)', get: (c) => c.total_spent_lkr },
+    { header: 'Booking Count', get: (c) => c.booking_count },
+  ])
+
+  await logBoth(req.user.id, 'export.customers_csv', null, { row_count: rows.length })
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="customers-${new Date().toISOString().slice(0, 10)}.csv"`)
+  res.send(csv)
 })
 
 // Full detail view for one customer: profile, saved addresses, recent
@@ -347,6 +430,29 @@ router.put('/settings/business-info', async (req, res) => {
   )
   await logBoth(req.user.id, 'settings.business_info_updated', null, parsed.data)
   res.json({ business_info: merged })
+})
+
+// ---- Booking reminder emails (on/off switch) ----
+const bookingRemindersSchema = z.object({
+  enabled: z.boolean(),
+})
+
+router.get('/settings/booking-reminders', async (req, res) => {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'booking_reminders'`)
+  res.json({ booking_reminders: rows[0]?.value ?? { enabled: true } })
+})
+
+router.put('/settings/booking-reminders', async (req, res) => {
+  const parsed = bookingRemindersSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('booking_reminders', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [JSON.stringify(parsed.data)]
+  )
+  await logBoth(req.user.id, 'settings.booking_reminders_updated', null, parsed.data)
+  res.json({ booking_reminders: parsed.data })
 })
 
 // ---- Homepage content (basic CMS — Section 2's "Page customization UI") ----

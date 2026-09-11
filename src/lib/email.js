@@ -96,6 +96,19 @@ export async function sendBookingConfirmationEmail(booking, serviceName, toEmail
   return send({ to: toEmail, subject: `Booking confirmed — ${serviceName}`, html })
 }
 
+export async function sendBookingReminderEmail(booking, serviceName, toEmail) {
+  const html = layout(
+    'See You Tomorrow',
+    `
+      <p>Just a friendly reminder about your appointment tomorrow:</p>
+      <p><strong>${serviceName}</strong><br/>
+      ${fmtDate(booking.booked_date)} at ${String(booking.booked_time).slice(0, 5)}</p>
+      <p style="font-size:13px; color:#5c5949;">Need to reschedule or cancel? Just reply to this email or reach out to us directly.</p>
+    `
+  )
+  return send({ to: toEmail, subject: `Reminder: ${serviceName} tomorrow`, html })
+}
+
 export async function sendBookingUpdateEmail(booking, serviceName, toEmail) {
   const statusText =
     booking.status === 'cancelled'
@@ -162,6 +175,22 @@ export async function sendNewAdminAlertEmail(newAdmin, actorName, toEmail) {
     `
   )
   return send({ to: toEmail, subject: `New ${newAdmin.role} account created — ${newAdmin.email}`, html })
+}
+
+// Spec Section 8's "Stock alerts widget" already shows this on the
+// dashboard, but only to someone actively looking at it. This is the
+// same information pushed out proactively instead — fires once per
+// product per crossing (see lib/lowStockAlert.js for why), not once per
+// sale, so it can't spam admins while a popular item slowly sells out.
+export async function sendLowStockAlertEmail(product, toEmail) {
+  const html = layout(
+    'Low Stock Alert',
+    `
+      <p><strong>${product.name}</strong> just dropped to <strong>${product.newQty}</strong> in stock — at or below its low-stock threshold of ${product.threshold}.</p>
+      <p style="font-size:13px; color:#5c5949;">Restock it, or adjust the threshold, from Admin → Products.</p>
+    `
+  )
+  return send({ to: toEmail, subject: `Low stock: ${product.name} (${product.newQty} left)`, html })
 }
 
 // The homepage "Visit us" contact form (project-spec.md "Contact form —

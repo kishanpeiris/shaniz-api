@@ -390,6 +390,10 @@ CREATE TABLE IF NOT EXISTS bookings (
 -- doesn't need one).
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_name TEXT;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_mobile TEXT;
+-- Booking reminder emails (day-before): set TRUE once a reminder has gone
+-- out for this booking, so the daily job never double-sends one even if
+-- it runs more than once or the booking spans a job restart.
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- One slot per service can't be double-booked — but a PARTIAL index
 -- (WHERE status != 'cancelled') rather than a plain table constraint, so
@@ -472,6 +476,12 @@ CREATE TABLE IF NOT EXISTS site_settings (
   value JSONB NOT NULL
 );
 INSERT INTO site_settings (key, value) VALUES ('maintenance_mode', 'false')
+  ON CONFLICT (key) DO NOTHING;
+
+-- Admin on/off switch for the day-before booking reminder email job
+-- (src/lib/bookingReminders.js). Defaults to on; an admin can flip it off
+-- from Settings without touching code or redeploying.
+INSERT INTO site_settings (key, value) VALUES ('booking_reminders', '{"enabled": true}')
   ON CONFLICT (key) DO NOTHING;
 
 INSERT INTO site_settings (key, value) VALUES ('business_info', '{
