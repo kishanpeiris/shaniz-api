@@ -22,6 +22,16 @@ const UNITS_SOLD_SUBQUERY = `
   ) sold ON sold.product_id = p.id
 `
 
+// Average rating + review count per product, joined the same way as
+// units-sold above (a live subquery, not a materialized column, so a
+// brand-new review shows up immediately without a background job).
+const RATINGS_SUBQUERY = `
+  LEFT JOIN (
+    SELECT product_id, ROUND(AVG(rating), 1) AS avg_rating, COUNT(*)::int AS review_count
+    FROM reviews GROUP BY product_id
+  ) rev ON rev.product_id = p.id
+`
+
 // Public: browse active products. Inactive/deactivated products are
 // only ever included when explicitly asked for with ?all=true AND the
 // requester is an admin — the admin product-management page passes that
@@ -35,7 +45,8 @@ router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const includeInactive = isAdmin && req.query.all === 'true'
   const { rows } = await query(
-    `SELECT p.id, p.name, p.description, p.price_lkr, p.stock_qty, p.category, p.category_id,
+    `SELECT p.id, p.name, p.description, p.name_si, p.name_ta, p.description_si, p.description_ta,
+            p.price_lkr, p.stock_qty, p.category, p.category_id,
             c.name AS category_name, c.parent_id AS category_parent_id, p.badges, p.images,
             p.hover_gif_url, p.hover_video_url, p.hover_webp_url, p.detail_video_url, p.is_active,
             p.image_focal_x, p.image_focal_y,
@@ -46,10 +57,13 @@ router.get('/', async (req, res) => {
               WHEN p.availability_mode = 'preorder' THEN 'preorder'
               ELSE 'out_of_stock'
             END AS availability,
-            COALESCE(sold.qty, 0)::int AS units_sold
+            COALESCE(sold.qty, 0)::int AS units_sold,
+            COALESCE(rev.avg_rating, 0)::float AS avg_rating,
+            COALESCE(rev.review_count, 0) AS review_count
      FROM products p
      LEFT JOIN categories c ON c.id = p.category_id
      ${UNITS_SOLD_SUBQUERY}
+     ${RATINGS_SUBQUERY}
      ${includeInactive ? '' : 'WHERE p.is_active = TRUE'}
      ORDER BY p.created_at DESC`
   )
@@ -67,8 +81,11 @@ router.get('/:id', async (req, res) => {
               WHEN p.stock_qty > 0 THEN 'in_stock'
               WHEN p.availability_mode = 'preorder' THEN 'preorder'
               ELSE 'out_of_stock'
-            END AS availability
+            END AS availability,
+            COALESCE(rev.avg_rating, 0)::float AS avg_rating,
+            COALESCE(rev.review_count, 0) AS review_count
      FROM products p LEFT JOIN categories c ON c.id = p.category_id
+     ${RATINGS_SUBQUERY}
      WHERE p.id = $1 ${isAdmin ? '' : 'AND p.is_active = TRUE'}`,
     [req.params.id]
   )
@@ -80,6 +97,14 @@ router.get('/:id', async (req, res) => {
 const productSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
+  // Admin-typed translations (no auto-translate — see
+  // SESSION-SUMMARY.md). All optional: a product with these left blank
+  // just falls back to the English name/description on the storefront,
+  // it never shows empty.
+  name_si: z.string().optional(),
+  name_ta: z.string().optional(),
+  description_si: z.string().optional(),
+  description_ta: z.string().optional(),
   price_lkr: z.number().nonnegative(),
   stock_qty: z.number().int().nonnegative().default(0),
   category: z.string().optional(),
@@ -116,11 +141,15 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const p = parsed.data
 
   const { rows } = await query(
-    `INSERT INTO products (name, description, price_lkr, stock_qty, category, category_id, badges, images, hover_gif_url, hover_video_url, hover_webp_url, detail_video_url, availability_mode, preorder_eta_days)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+    `INSERT INTO products (name, description, name_si, name_ta, description_si, description_ta, price_lkr, stock_qty, category, category_id, badges, images, hover_gif_url, hover_video_url, hover_webp_url, detail_video_url, availability_mode, preorder_eta_days)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
     [
       p.name,
       p.description ?? null,
+      p.name_si ?? null,
+      p.name_ta ?? null,
+      p.description_si ?? null,
+      p.description_ta ?? null,
       p.price_lkr,
       p.stock_qty,
       p.category ?? null,

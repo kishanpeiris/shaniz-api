@@ -135,6 +135,53 @@ router.get('/activity-log', async (req, res) => {
   res.json({ activity_log: rows })
 })
 
+// Export as a downloadable file — same reasoning as the orders/customers
+// exports above: no row cap (the live view above caps at 500/200 rows,
+// but export means "give me everything you've still got"), which for
+// these two tables just means everything within their existing 30-day
+// and 15-day retention windows (logPurge.js already deletes anything
+// older, so there's nothing beyond that to export anyway). Joins in the
+// actor's name/email rather than leaving a bare UUID in the file.
+router.get('/export/audit-log.csv', async (req, res) => {
+  const { rows } = await query(
+    `SELECT a.*, u.name AS actor_name, u.email AS actor_email
+     FROM audit_log a
+     LEFT JOIN users u ON u.id = a.actor_id
+     WHERE a.created_at > now() - interval '30 days'
+     ORDER BY a.created_at DESC`
+  )
+  const csv = toCsv(rows, [
+    { header: 'Timestamp', get: (r) => new Date(r.created_at).toISOString() },
+    { header: 'Actor', get: (r) => r.actor_name ?? (r.actor_id ? r.actor_id : 'System') },
+    { header: 'Actor Email', get: (r) => r.actor_email },
+    { header: 'Action', get: (r) => r.action },
+    { header: 'Target', get: (r) => r.target },
+    { header: 'Metadata', get: (r) => (r.metadata ? JSON.stringify(r.metadata) : '') },
+  ])
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="audit-log-${new Date().toISOString().slice(0, 10)}.csv"`)
+  res.send(csv)
+})
+
+router.get('/export/activity-log.csv', async (req, res) => {
+  const { rows } = await query(
+    `SELECT a.*, u.name AS actor_name, u.email AS actor_email
+     FROM activity_log a
+     LEFT JOIN users u ON u.id = a.actor_id
+     WHERE a.created_at > now() - interval '15 days'
+     ORDER BY a.created_at DESC`
+  )
+  const csv = toCsv(rows, [
+    { header: 'Timestamp', get: (r) => new Date(r.created_at).toISOString() },
+    { header: 'Actor', get: (r) => r.actor_name ?? (r.actor_id ? r.actor_id : 'System') },
+    { header: 'Actor Email', get: (r) => r.actor_email },
+    { header: 'Action', get: (r) => r.action },
+  ])
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8')
+  res.setHeader('Content-Disposition', `attachment; filename="activity-log-${new Date().toISOString().slice(0, 10)}.csv"`)
+  res.send(csv)
+})
+
 // ---- Customer account management ----
 // Expanded per the registration overhaul: shows verification status plus
 // order count / total spent / booking count so an admin doesn't have to
@@ -402,8 +449,22 @@ router.delete('/admins/:id', requireRole('superadmin'), async (req, res) => {
 const businessInfoSchema = z.object({
   phone: z.string().max(50).optional(),
   email: z.string().email().optional(),
-  address: z.string().max(300).optional(),
-  facebook_url: z.string().url().optional(),
+  // NOTE: address was removed from here — branches (branches.routes.js)
+  // are now the single source of truth for physical addresses, since a
+  // business can have more than one location. Any old `address` value
+  // already saved in this JSONB blob from before this change is
+  // harmless leftover data — it's just no longer read or shown anywhere.
+  //
+  // Every URL field below uses .optional().or(z.literal('')) rather than
+  // just .optional() — .optional() alone only allows the field to be
+  // MISSING, not an empty string, so saving the form with a field
+  // intentionally left blank would fail validation for the ENTIRE
+  // request (a real bug, found and fixed here — facebook_url had this
+  // exact issue before this change).
+  facebook_url: z.string().url().optional().or(z.literal('')),
+  instagram_url: z.string().url().optional().or(z.literal('')),
+  tiktok_url: z.string().url().optional().or(z.literal('')),
+  linkedin_url: z.string().url().optional().or(z.literal('')),
   // Digits only, with country code, no + or spaces (e.g. "94771234567")
   // — that's the exact format wa.me links need. Validated loosely here;
   // the frontend strips non-digits before saving so a pasted "+94 77

@@ -176,6 +176,16 @@ CREATE TABLE IF NOT EXISTS products (
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hover_video_url TEXT;
 ALTER TABLE products ADD COLUMN IF NOT EXISTS hover_webp_url TEXT;
 
+-- Per-language content (admin fills these in manually — see the "no
+-- auto-translate" decision in SESSION-SUMMARY.md). English stays in the
+-- original name/description columns as the base value and fallback;
+-- these are purely additive, so a product with nothing typed into them
+-- yet still displays perfectly normally in English.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS name_si TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS name_ta TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description_si TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description_ta TEXT;
+
 -- Admin-manageable categories with optional one-level subcategories
 -- (parent_id). Shared table for both products and services, scoped by
 -- `kind` — a "Hair Care" product category and a "Hair Care" service
@@ -285,6 +295,16 @@ ALTER TABLE products ADD COLUMN IF NOT EXISTS image_focal_x REAL NOT NULL DEFAUL
 ALTER TABLE products ADD COLUMN IF NOT EXISTS image_focal_y REAL NOT NULL DEFAULT 50;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS image_focal_x REAL NOT NULL DEFAULT 50;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS image_focal_y REAL NOT NULL DEFAULT 50;
+
+-- Per-language descriptions. `description` (no suffix) stays the
+-- English/default copy — these are optional overrides for the other
+-- two languages. NULL just means "no Sinhala/Tamil version written yet,
+-- fall back to English", which the API and storefront both already
+-- treat as the normal, expected case for anything not yet translated.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description_si TEXT;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS description_ta TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS description_si TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS description_ta TEXT;
 
 CREATE TABLE IF NOT EXISTS service_availability (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -409,6 +429,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS bookings_active_slot_unique
   ON bookings (service_id, booked_date, booked_time)
   WHERE status != 'cancelled';
 
+-- ---------------------------------------------------------------------
+-- Product reviews & ratings. Only a customer who actually bought the
+-- product (a 'paid'/'shipped'/'completed' order containing this product
+-- id) may post one — checked in reviews.routes.js against orders.items
+-- the same way UNITS_SOLD_SUBQUERY does in products.routes.js, since
+-- there's no separate order_items table. is_verified_purchase is stored
+-- on the row (not recomputed on every read) so it stays accurate even
+-- if the order is later cancelled/refunded after the review was posted.
+CREATE TABLE IF NOT EXISTS reviews (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_id           UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  user_id              UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_id             UUID REFERENCES orders(id) ON DELETE SET NULL,
+  rating               INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
+  title                TEXT,
+  comment              TEXT,
+  is_verified_purchase BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (product_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_product_id ON reviews (product_id);
+
 CREATE TABLE IF NOT EXISTS invoices (
   id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id  UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -515,6 +557,26 @@ INSERT INTO site_settings (key, value) VALUES ('homepage_content', '{
   "ritual_subtext": "Two staples to start with — an oil for the scalp, a mask for the strands. Hover a product to see what''s inside."
 }')
   ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------
+-- UI translations (buttons, labels, static page copy — NOT product/
+-- service content, which lives on those tables directly as _si/_ta
+-- columns instead). Admin-editable from Admin -> Translations.
+--
+-- Seeded from scripts/seed-translations.js, which mirrors (and must be
+-- kept in sync with) shaniz-site/src/i18n/translations.js — the two
+-- projects are separate deploys, so this is a deliberate one-time copy,
+-- not a live link. After the FIRST deploy, this table is the source of
+-- truth: re-running the seed script only adds brand-new keys (ON
+-- CONFLICT DO NOTHING), it never overwrites an admin's edits.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS translations (
+  key        TEXT PRIMARY KEY,
+  en         TEXT NOT NULL,
+  si         TEXT,
+  ta         TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
 -- ---------------------------------------------------------------------
 -- Auto-purge old logs. Requires the `pg_cron` extension (available on

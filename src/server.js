@@ -32,6 +32,7 @@ import adminRoutes from './routes/admin.routes.js'
 import siteRoutes from './routes/site.routes.js'
 import accountRoutes from './routes/account.routes.js'
 import uploadRoutes from './routes/uploads.routes.js'
+import reviewRoutes from './routes/reviews.routes.js'
 import { localUploadDir, isCloudinaryConfigured } from './lib/uploads.js'
 
 const app = express()
@@ -91,6 +92,10 @@ app.use('/api/orders', orderRoutes)
 app.use('/api/site', siteRoutes)
 app.use('/api/account', accountRoutes)
 app.use('/api/uploads', uploadRoutes)
+// Defines its own two paths (/api/products/:id/reviews, /api/reviews/:id)
+// rather than sitting under one fixed prefix, so it's mounted at the
+// bare /api root instead of alongside the other single-resource routes.
+app.use('/api', reviewRoutes)
 app.use('/api/admin', requireRole('admin', 'superadmin'), adminRoutes)
 
 // ---- error handler (last) ----
