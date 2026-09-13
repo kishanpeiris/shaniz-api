@@ -15,29 +15,81 @@ router.get('/', async (req, res) => {
 })
 
 // "Find coordinates from this address" — used by the admin branch form
-// so admins don't have to hunt down lat/long manually. Uses OpenStreetMap's
-// Nominatim geocoder: free, no API key or billing account (unlike Google's
-// Geocoding API), which fits this project's existing "no paid map keys"
-// pattern (see maps.js's output=embed trick). Nominatim's usage policy
-// requires a real User-Agent identifying the app and asks for max ~1
-// request/second — both are naturally satisfied here since this only
-// ever fires on an admin manually clicking "Find on map", not on every
-// keystroke or public storefront traffic.
+// so admins don't have to hunt down lat/long manually.
+//
+// Primary: LocationIQ (https://locationiq.com) — free tier (5,000
+// requests/day, no credit card), and its /search endpoint returns the
+// exact same lat/lon/display_name shape as Nominatim, so no other code
+// needed to change. Falls back to OpenStreetMap's Nominatim (no key at
+// all) when GEOCODING_API_KEY isn't set, so this still works out of the
+// box for local dev / anyone who hasn't signed up yet.
+//
+// Why not just Nominatim for production too: its public demo server is
+// meant for light, non-commercial use and actively rate-limits/blocks
+// requests from shared cloud-hosting IP ranges (Render/Railway/Vercel
+// all draw from pools other Nominatim users have already gotten
+// throttled) — the exact "Geocoding service returned an error" failure
+// this was hitting. LocationIQ's free tier is normal API-key access, no
+// such shared-IP penalty.
+async function geocodeWithLocationIQ(address, apiKey) {
+  const url = `https://us1.locationiq.com/v1/search?key=${apiKey}&format=json&limit=1&q=${encodeURIComponent(address)}`
+  const response = await fetch(url, { headers: { Accept: 'application/json' } })
+  const body = await response.json().catch(() => null)
+  if (!response.ok) {
+    console.error('[geocode] LocationIQ error', response.status, body)
+    throw new Error(`LocationIQ returned ${response.status}`)
+  }
+  return body
+}
+
+async function geocodeWithNominatim(address) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'ShanizAdminPanel/1.0 (branch location lookup)',
+      Accept: 'application/json',
+    },
+  })
+  const body = await response.json().catch(() => null)
+  if (!response.ok) {
+    console.error('[geocode] Nominatim error', response.status, body)
+    throw new Error(`Nominatim returned ${response.status}`)
+  }
+  return body
+}
+
 router.get('/geocode', requireRole('admin', 'superadmin'), async (req, res) => {
   const address = z.string().min(1).safeParse(req.query.address)
   if (!address.success) return res.status(400).json({ error: 'address is required.' })
 
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address.data)}`
-  let response
-  try {
-    response = await fetch(url, { headers: { 'User-Agent': 'ShanizAdminPanel/1.0 (branch location lookup)' } })
-  } catch {
-    return res.status(502).json({ error: 'Could not reach the geocoding service. Try again in a moment.' })
-  }
-  if (!response.ok) return res.status(502).json({ error: 'Geocoding service returned an error.' })
+  const apiKey = process.env.GEOCODING_API_KEY
 
-  const results = await response.json()
-  if (!results[0]) return res.status(404).json({ error: 'No location found for that address — try adding more detail (city, country), or place the pin manually on the map.' })
+  let results
+  try {
+    results = apiKey ? await geocodeWithLocationIQ(address.data, apiKey) : await geocodeWithNominatim(address.data)
+  } catch (primaryErr) {
+    // If the paid-tier-free key is configured but that call itself
+    // failed (network blip, quota briefly exceeded), Nominatim is worth
+    // one attempt before giving up entirely.
+    if (apiKey) {
+      try {
+        results = await geocodeWithNominatim(address.data)
+      } catch (fallbackErr) {
+        console.error('[geocode] both providers failed:', primaryErr.message, fallbackErr.message)
+        return res.status(502).json({
+          error: 'Geocoding service returned an error. You can place the pin on the map manually instead.',
+        })
+      }
+    } else {
+      console.error('[geocode] failed:', primaryErr.message)
+      return res.status(502).json({
+        error:
+          'Geocoding service returned an error — this free lookup occasionally gets rate-limited on shared hosting. Add a free LocationIQ API key (GEOCODING_API_KEY) for reliable results, or place the pin on the map manually.',
+      })
+    }
+  }
+
+  if (!results?.[0]) return res.status(404).json({ error: 'No location found for that address — try adding more detail (city, country), or place the pin manually on the map.' })
 
   res.json({ latitude: Number(results[0].lat), longitude: Number(results[0].lon), display_name: results[0].display_name })
 })

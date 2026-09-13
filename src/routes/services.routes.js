@@ -23,7 +23,8 @@ router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const includeInactive = isAdmin && req.query.all === 'true'
   const { rows } = await query(
-    `SELECT s.id, s.name, s.description, s.price_lkr, s.service_type, s.duration_minutes, s.images,
+    `SELECT s.id, s.name, s.description, s.name_si, s.name_ta, s.description_si, s.description_ta,
+            s.price_lkr, s.service_type, s.duration_minutes, s.images,
             s.hover_video_url, s.hover_webp_url, s.hover_gif_url, s.detail_video_url, s.is_active, s.branch_id,
             s.category_id, c.name AS category, c.parent_id AS category_parent_id, s.badges,
             s.image_focal_x, s.image_focal_y,
@@ -60,6 +61,12 @@ router.get('/:id', async (req, res) => {
 const serviceSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
+  // Admin-typed translations — same "optional, falls back to English"
+  // pattern as products.routes.js's productSchema.
+  name_si: z.string().optional(),
+  name_ta: z.string().optional(),
+  description_si: z.string().optional(),
+  description_ta: z.string().optional(),
   price_lkr: z.number().nonnegative(),
   service_type: z.enum(['bookable', 'purchasable']),
   duration_minutes: z.number().int().positive().optional(),
@@ -89,11 +96,15 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   }
 
   const { rows } = await query(
-    `INSERT INTO services (name, description, price_lkr, service_type, duration_minutes, category_id, badges, images, hover_video_url, hover_webp_url, hover_gif_url, detail_video_url, branch_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    `INSERT INTO services (name, description, name_si, name_ta, description_si, description_ta, price_lkr, service_type, duration_minutes, category_id, badges, images, hover_video_url, hover_webp_url, hover_gif_url, detail_video_url, branch_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
     [
       s.name,
       s.description ?? null,
+      s.name_si ?? null,
+      s.name_ta ?? null,
+      s.description_si ?? null,
+      s.description_ta ?? null,
       s.price_lkr,
       s.service_type,
       s.duration_minutes ?? null,

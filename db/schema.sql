@@ -257,6 +257,10 @@ CREATE TABLE IF NOT EXISTS services (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   name         TEXT NOT NULL,
   description  TEXT,
+  name_si      TEXT,
+  name_ta      TEXT,
+  description_si TEXT,
+  description_ta TEXT,
   price_lkr    NUMERIC(12,2) NOT NULL CHECK (price_lkr >= 0),
   service_type TEXT NOT NULL CHECK (service_type IN ('bookable', 'purchasable')),
   duration_minutes INTEGER, -- required for bookable services
@@ -274,6 +278,13 @@ CREATE TABLE IF NOT EXISTS services (
 -- and branches existed (CREATE TABLE IF NOT EXISTS above is a no-op in
 -- that case — see the matching note on the products table above).
 ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_video_url TEXT;
+-- Same manual per-language columns as products (see the products table
+-- below) — added via explicit ALTERs too since services predates this
+-- feature on existing deployments.
+ALTER TABLE services ADD COLUMN IF NOT EXISTS name_si TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS name_ta TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS description_si TEXT;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS description_ta TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_webp_url TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS hover_gif_url TEXT;
 ALTER TABLE services ADD COLUMN IF NOT EXISTS branch_id UUID REFERENCES branches(id) ON DELETE SET NULL;

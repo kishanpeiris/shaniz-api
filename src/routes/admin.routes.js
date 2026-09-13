@@ -4,7 +4,7 @@ import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
-import { generateProductDescription } from '../lib/ai.js'
+import { generateProductDescription, translateText } from '../lib/ai.js'
 import { sendNewAdminAlertEmail } from '../lib/email.js'
 import { getSuperadminEmails } from '../lib/notifications.js'
 import { toCsv } from '../lib/csv.js'
@@ -93,6 +93,24 @@ router.post('/ai/product-description', async (req, res) => {
     const description = await generateProductDescription(parsed.data)
     await logBoth(req.user.id, 'ai.description_generated', null, { product_name: parsed.data.name })
     res.json({ description })
+  } catch (err) {
+    res.status(err.status ?? 500).json({ error: err.message })
+  }
+})
+
+// ---- AI-assisted translation (Sinhala/Tamil) for any admin text field ----
+const aiTranslateSchema = z.object({
+  text: z.string().min(1).max(2000),
+  targetLang: z.enum(['si', 'ta']),
+})
+
+router.post('/ai/translate', async (req, res) => {
+  const parsed = aiTranslateSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  try {
+    const translation = await translateText(parsed.data)
+    res.json({ translation })
   } catch (err) {
     res.status(err.status ?? 500).json({ error: err.message })
   }
@@ -521,10 +539,20 @@ router.put('/settings/booking-reminders', async (req, res) => {
 // this is marketing copy, not anything security-sensitive.
 const homepageContentSchema = z.object({
   hero_eyebrow: z.string().max(120).optional(),
+  hero_eyebrow_si: z.string().max(120).optional(),
+  hero_eyebrow_ta: z.string().max(120).optional(),
   hero_headline: z.string().max(300).optional(),
+  hero_headline_si: z.string().max(300).optional(),
+  hero_headline_ta: z.string().max(300).optional(),
   hero_subtext: z.string().max(500).optional(),
+  hero_subtext_si: z.string().max(500).optional(),
+  hero_subtext_ta: z.string().max(500).optional(),
   hero_cta1_label: z.string().max(60).optional(),
+  hero_cta1_label_si: z.string().max(60).optional(),
+  hero_cta1_label_ta: z.string().max(60).optional(),
   hero_cta2_label: z.string().max(60).optional(),
+  hero_cta2_label_si: z.string().max(60).optional(),
+  hero_cta2_label_ta: z.string().max(60).optional(),
   // Empty string is a valid value here (it means "clear the override,
   // go back to the bundled default image/video" — see the frontend's
   // fallback logic in Hero.jsx/About.jsx/Products.jsx), so these accept
@@ -532,14 +560,28 @@ const homepageContentSchema = z.object({
   hero_background_url: z.union([z.string().url(), z.literal('')]).optional(),
   hero_video_url: z.union([z.string().url(), z.literal('')]).optional(),
   about_eyebrow: z.string().max(120).optional(),
+  about_eyebrow_si: z.string().max(120).optional(),
+  about_eyebrow_ta: z.string().max(120).optional(),
   about_headline: z.string().max(300).optional(),
+  about_headline_si: z.string().max(300).optional(),
+  about_headline_ta: z.string().max(300).optional(),
   about_paragraph1: z.string().max(1000).optional(),
+  about_paragraph1_si: z.string().max(1000).optional(),
+  about_paragraph1_ta: z.string().max(1000).optional(),
   about_paragraph2: z.string().max(1000).optional(),
+  about_paragraph2_si: z.string().max(1000).optional(),
+  about_paragraph2_ta: z.string().max(1000).optional(),
   about_image_url: z.union([z.string().url(), z.literal('')]).optional(),
   about_background_url: z.union([z.string().url(), z.literal('')]).optional(),
   ritual_eyebrow: z.string().max(120).optional(),
+  ritual_eyebrow_si: z.string().max(120).optional(),
+  ritual_eyebrow_ta: z.string().max(120).optional(),
   ritual_headline: z.string().max(300).optional(),
+  ritual_headline_si: z.string().max(300).optional(),
+  ritual_headline_ta: z.string().max(300).optional(),
   ritual_subtext: z.string().max(500).optional(),
+  ritual_subtext_si: z.string().max(500).optional(),
+  ritual_subtext_ta: z.string().max(500).optional(),
   ritual_background_url: z.union([z.string().url(), z.literal('')]).optional(),
   // Up to 9 process-video URLs (shown 3 at a time on the homepage, with
   // paging arrows past that — see RowCarousel.jsx). Capped server-side

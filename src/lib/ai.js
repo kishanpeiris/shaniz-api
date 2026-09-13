@@ -110,3 +110,83 @@ export async function generateProductDescription({ name, category, hint }) {
   }
   return text
 }
+
+// One-click admin translation (Sinhala/Tamil) — used by TranslationFields.jsx
+// so admins don't have to hand-type every name/description twice. The
+// admin always sees and can edit the result before saving, same as the
+// description generator above; this never writes to the database
+// directly. Shares the same GEMINI_API_KEY/MODEL as the description
+// generator above rather than needing a second key.
+const TRANSLATE_LANGUAGE_NAMES = { si: 'Sinhala', ta: 'Tamil' }
+
+export async function translateText({ text, targetLang }) {
+  const languageName = TRANSLATE_LANGUAGE_NAMES[targetLang]
+  if (!languageName) {
+    const err = new Error(`Unsupported target language: ${targetLang}`)
+    err.status = 400
+    throw err
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) {
+    const err = new Error(
+      'Auto-translate isn\u2019t set up yet \u2014 add a free GEMINI_API_KEY (from https://aistudio.google.com/apikey) to the backend\u2019s environment variables.'
+    )
+    err.status = 400
+    throw err
+  }
+
+  if (!text?.trim()) {
+    const err = new Error('Nothing to translate \u2014 fill in the English text first.')
+    err.status = 400
+    throw err
+  }
+
+  const prompt =
+    `Translate the following English text for a Sri Lankan herbal/ayurvedic beauty brand's ` +
+    `website into natural, everyday ${languageName} \u2014 the way a fluent ${languageName} speaker ` +
+    `would actually write it for customers, not a stiff literal translation. Preserve the tone ` +
+    `(warm, simple). If the text contains simple markdown like "### " headings or "- " bullet ` +
+    `points, keep that same structure in the translation. Return ONLY the translated text \u2014 ` +
+    `no quotes, no notes, no explanation.\n\nText:\n${text}`
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.3,
+          maxOutputTokens: 1024,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
+    }
+  )
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '')
+    if (response.status === 429) {
+      const err = new Error('The free Gemini quota was hit for the moment \u2014 wait about a minute and try again.')
+      err.status = 429
+      throw err
+    }
+    const err = new Error(`Translation request failed (${response.status}). ${body.slice(0, 200)}`)
+    err.status = 502
+    throw err
+  }
+
+  const data = await response.json()
+  const translated = data.candidates?.[0]?.content?.parts?.map((p) => p.text).join('')?.trim()
+  if (!translated) {
+    const err = new Error('Translation came back empty \u2014 it may have been blocked by a safety filter.')
+    err.status = 502
+    throw err
+  }
+  return translated
+}
