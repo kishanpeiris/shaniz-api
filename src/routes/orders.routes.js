@@ -3,9 +3,9 @@ import { z } from 'zod'
 import { query, pool } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth, logAudit } from '../lib/log.js'
-import { sendOrderConfirmationEmail, sendShippingNoticeEmail, sendInvoiceEmail, sendFraudAlertEmail } from '../lib/email.js'
+import { sendOrderConfirmationEmail, sendShippingNoticeEmail, sendInvoiceEmail, sendFraudAlertEmail, sendRefundRequestReceivedEmail, sendRefundRequestResolvedEmail } from '../lib/email.js'
 import { sendOrderConfirmationSms } from '../lib/sms.js'
-import { createCheckoutSession, GATEWAYS } from '../lib/gateways.js'
+import { createCheckoutSession, isConfigured, refundPayment, GATEWAYS } from '../lib/gateways.js'
 import { deliveryFee, isValidRegion } from '../lib/delivery.js'
 import { evaluateOrderRisk, recordFraudFlags } from '../lib/fraud.js'
 import { getSuperadminEmails } from '../lib/notifications.js'
@@ -22,11 +22,21 @@ import { storePdf } from '../lib/uploads.js'
 // generates one, stores it, and records it in the `invoices` table.
 async function ensureInvoice(order) {
   const existing = await query('SELECT pdf_url FROM invoices WHERE order_id = $1', [order.id])
-  if (existing.rows[0]?.pdf_url) return existing.rows[0].pdf_url
+  // Re-generate rather than reuse if the stored URL doesn't actually end
+  // in .pdf — a handful of invoices generated before the Cloudinary
+  // raw-upload extension fix (see storeBuffer in lib/uploads.js) have
+  // this exact broken shape cached in the table already; this makes
+  // them self-heal the next time anyone downloads that invoice, rather
+  // than needing a manual DB fix.
+  if (existing.rows[0]?.pdf_url?.toLowerCase().endsWith('.pdf')) return existing.rows[0].pdf_url
 
   const buffer = await generateInvoicePdf(order)
   const pdfUrl = await storePdf(buffer)
-  await query('INSERT INTO invoices (order_id, pdf_url) VALUES ($1, $2)', [order.id, pdfUrl])
+  if (existing.rows[0]) {
+    await query('UPDATE invoices SET pdf_url = $1, issued_at = now() WHERE order_id = $2', [pdfUrl, order.id])
+  } else {
+    await query('INSERT INTO invoices (order_id, pdf_url) VALUES ($1, $2)', [order.id, pdfUrl])
+  }
   return pdfUrl
 }
 
@@ -127,6 +137,16 @@ router.post('/', async (req, res) => {
   }
   if (d.delivery_method === 'delivery' && !d.shipping_address_id && !d.shipping_address) {
     return res.status(400).json({ error: 'A shipping address is required for delivery.' })
+  }
+  // Fails fast, before creating anything, if the chosen gateway has no
+  // live credentials AND this is a real production deployment with
+  // sandbox payments not deliberately enabled (see the matching check
+  // in POST /:id/sandbox-pay for the full reasoning) — otherwise the
+  // customer would fill in their entire address and card details only
+  // to hit a wall on the very last click.
+  const sandboxBlockedInProd = process.env.NODE_ENV === 'production' && process.env.ENABLE_SANDBOX_IN_PRODUCTION !== 'true'
+  if (sandboxBlockedInProd && !isConfigured(d.gateway)) {
+    return res.status(400).json({ error: 'This payment method is not available yet. Please choose a different one.' })
   }
 
   const client = await pool.connect()
@@ -325,6 +345,152 @@ router.get('/mine', async (req, res) => {
 // checkout. A guest with no session can still view their own order by
 // passing the email they checked out with; anyone else gets a 404 rather
 // than a 403, so this can't be used to probe which order IDs exist.
+// ---- Cancellation & return/refund requests ----
+//
+// A request never changes order.status by itself — only an admin
+// approving one does (see PUT /api/admin/refund-requests/:id below).
+// That's a deliberate choice: this system has no live payment gateway
+// yet (see lib/gateways.js), so there's no way to *guarantee* an
+// automatic refund actually happened — a human confirms it, the same
+// way the project already treats bookings ("admin-initiated at
+// minimum," per project-spec.md Section 2).
+//
+// Cancellation: allowed any time before the order has actually reached
+// the customer — which for a pickup order means "not yet collected,"
+// not "not yet marked ready," since nothing has changed hands yet even
+// once it's sitting on the shelf waiting.
+function cancellationEligible(order) {
+  if (['pending', 'paid'].includes(order.status)) return true
+  if (order.status === 'shipped' && order.delivery_method === 'pickup') return true
+  return false
+}
+
+// Return/refund: only after the order is actually done (delivered or
+// collected), and only within a fixed window afterward — adjustable by
+// admins (Settings → Order Policies) rather than hardcoded, since 14
+// days won't fit every business. There's no dedicated "completed_at"
+// timestamp column, so this uses updated_at as the closest available
+// proxy for "when it was marked completed" — true as long as nothing
+// else touches an order after that point, which matches how the admin
+// status flow actually works today.
+const DEFAULT_RETURN_WINDOW_DAYS = 14
+async function getReturnWindowDays() {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'order_policies'`)
+  const days = rows[0]?.value?.return_window_days
+  return Number.isFinite(days) ? days : DEFAULT_RETURN_WINDOW_DAYS
+}
+async function returnEligible(order) {
+  if (order.status !== 'completed') return false
+  const windowDays = await getReturnWindowDays()
+  const daysSinceCompleted = (Date.now() - new Date(order.updated_at).getTime()) / 86400000
+  return daysSinceCompleted <= windowDays
+}
+
+// Same ownership rule GET /:id and GET /:id/invoice already use,
+// pulled out so the two request endpoints below don't need a third
+// copy of it. Writes the 404-or-null response itself so call sites can
+// just `if (!order) return`.
+async function loadAccessibleOrder(req, res) {
+  const { rows } = await query('SELECT * FROM orders WHERE id = $1', [req.params.id])
+  const order = rows[0]
+  if (!order) {
+    res.status(404).json({ error: 'Order not found.' })
+    return null
+  }
+  const isOwner = req.user && order.user_id === req.user.id
+  const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
+  const isGuestMatch = !order.user_id && order.guest_email && req.query.email === order.guest_email
+  if (!isOwner && !isAdmin && !isGuestMatch) {
+    res.status(404).json({ error: 'Order not found.' })
+    return null
+  }
+  return order
+}
+
+const refundRequestSchema = z.object({ reason: z.string().min(1, 'Please tell us why.').max(1000) })
+
+async function createRefundRequest(req, res, type, eligible, ineligibleMessage) {
+  const parsed = refundRequestSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  const order = await loadAccessibleOrder(req, res)
+  if (!order) return
+
+  // ineligibleMessage can be a plain string or a function returning one
+  // (async or not) — return-request needs the current admin-configured
+  // window baked into its message, which a static string can't do.
+  if (!(await eligible(order))) {
+    const message = typeof ineligibleMessage === 'function' ? await ineligibleMessage() : ineligibleMessage
+    return res.status(400).json({ error: message })
+  }
+
+  const existing = await query(`SELECT id FROM refund_requests WHERE order_id = $1 AND status = 'pending'`, [order.id])
+  if (existing.rows[0]) {
+    return res.status(409).json({ error: 'A request for this order is already pending review.' })
+  }
+
+  // customer_email is always populated at order-creation time (either
+  // the logged-in user's email or the guest's) — see the INSERT in
+  // POST / above — so this never actually needs the guest_email
+  // fallback in practice; kept only as a defensive fallback for any
+  // pre-existing order where that assumption somehow doesn't hold.
+  const email = order.customer_email || order.guest_email
+  let request
+  try {
+    const { rows } = await query(
+      `INSERT INTO refund_requests (order_id, type, reason, requested_by_user_id, requested_by_email)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [order.id, type, parsed.data.reason, req.user?.id ?? null, email]
+    )
+    request = rows[0]
+  } catch (err) {
+    // 23505 = unique_violation on idx_refund_requests_one_pending_per_order
+    // — the SELECT check above already covers the common case, but a
+    // second submit within the same instant (double-click, or the
+    // request retrying after a dropped connection) can still race past
+    // it; the database constraint is the real backstop, this just turns
+    // that into the same friendly message instead of a raw 500.
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'A request for this order is already pending review.' })
+    }
+    throw err
+  }
+
+  await logBoth(req.user?.id ?? null, `refund_request.${type}`, order.id, { reason: parsed.data.reason })
+
+  // Best-effort — a delivery hiccup on this notification shouldn't fail
+  // the customer's request itself; the request is already saved and
+  // will show up in Admin → Refund Requests regardless.
+  try {
+    const admins = await getSuperadminEmails()
+    await Promise.all(admins.map((toEmail) => sendRefundRequestReceivedEmail(order, request, toEmail)))
+  } catch (err) {
+    console.error('[refund-request] admin notification failed:', err.message)
+  }
+
+  res.status(201).json({ refund_request: request })
+}
+
+router.post('/:id/cancel-request', (req, res) =>
+  createRefundRequest(
+    req,
+    res,
+    'cancellation',
+    async (order) => cancellationEligible(order),
+    'This order can no longer be cancelled online — please contact us instead.'
+  )
+)
+
+router.post('/:id/return-request', (req, res) =>
+  createRefundRequest(
+    req,
+    res,
+    'return',
+    returnEligible,
+    async () => `Returns are only available within ${await getReturnWindowDays()} days of an order being completed.`
+  )
+)
+
 router.get('/:id', async (req, res) => {
   const { rows } = await query('SELECT * FROM orders WHERE id = $1', [req.params.id])
   const order = rows[0]
@@ -338,7 +504,28 @@ router.get('/:id', async (req, res) => {
   if (!isOwner && !isAdmin && !isGuestMatch) {
     return res.status(404).json({ error: 'Order not found.' })
   }
-  res.json({ order })
+
+  // The most recent request (of either type) for this order, if any —
+  // lets the customer's order page show "cancellation pending review" /
+  // "return approved" etc. without a second request. can_cancel/
+  // can_return are computed here (not left for the frontend to guess
+  // at) so the eligibility rule only lives in one place — see
+  // cancellationEligible/returnEligible below.
+  const { rows: requestRows } = await query(
+    'SELECT * FROM refund_requests WHERE order_id = $1 ORDER BY created_at DESC LIMIT 1',
+    [order.id]
+  )
+  const existingRequest = requestRows[0] || null
+  const hasPendingRequest = existingRequest?.status === 'pending'
+
+  res.json({
+    order: {
+      ...order,
+      refund_request: existingRequest,
+      can_cancel: !hasPendingRequest && cancellationEligible(order),
+      can_return: !hasPendingRequest && (await returnEligible(order)),
+    },
+  })
 })
 
 // On-demand invoice PDF (spec Section 2: "Invoice generation (PDF, auto
@@ -374,6 +561,20 @@ router.get('/:id/invoice', async (req, res) => {
 // with real credentials, so this can never be used to fake-pay a real
 // live transaction once you go live.
 router.post('/:id/sandbox-pay', async (req, res) => {
+  // Blocks this endpoint on a real production deployment by default —
+  // the only existing guard below (`session.live`) only fires once a
+  // *specific* gateway has live credentials configured, which means as
+  // long as none of Koko/IntPay/Dialog Genie are live yet, this endpoint
+  // stays wide open on the real public site: anyone can "pay" for a
+  // real order without any money changing hands. That's exactly the
+  // gap this closes. Set ENABLE_SANDBOX_IN_PRODUCTION=true as a
+  // deliberate, temporary opt-in if you need to demo a full purchase
+  // flow on the live URL before any gateway is ready — remove it again
+  // before actually announcing the site.
+  if (process.env.NODE_ENV === 'production' && process.env.ENABLE_SANDBOX_IN_PRODUCTION !== 'true') {
+    return res.status(403).json({ error: 'Sandbox payments are disabled in production.' })
+  }
+
   const parsed = z
     .object({
       outcome: z.enum(['success', 'failed']).default('success'),

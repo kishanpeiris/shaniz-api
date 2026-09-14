@@ -111,7 +111,46 @@ export async function generateProductDescription({ name, category, hint }) {
   return text
 }
 
-// One-click admin translation (Sinhala/Tamil) — used by TranslationFields.jsx
+// Translates an incoming customer message (contact form, not admin
+// CMS copy) into English for the business owner/admin to read — a
+// deliberately separate, simpler function from translateText() above:
+// no "brand website copy" framing, no markdown-structure preservation,
+// just a faithful plain-language translation of whatever a visitor
+// wrote in Sinhala or Tamil. Returns null (never throws) on any
+// failure — a translation hiccup should never block the contact form
+// itself from sending; the original message always goes through
+// regardless, this is purely an added convenience for the reader.
+export async function translateToEnglish(text) {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey || !text?.trim()) return null
+
+  const prompt =
+    `Translate the following customer message into plain, natural English. ` +
+    `Return ONLY the translation, no notes or quotes.\n\nMessage:\n${text}`
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 1024, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }
+    )
+    if (!response.ok) {
+      console.error('[translateToEnglish] Gemini error', response.status, await response.text().catch(() => ''))
+      return null
+    }
+    const data = await response.json()
+    return data.candidates?.[0]?.content?.parts?.map((p) => p.text).join('')?.trim() || null
+  } catch (err) {
+    console.error('[translateToEnglish] request failed', err.message)
+    return null
+  }
+}
 // so admins don't have to hand-type every name/description twice. The
 // admin always sees and can edit the result before saving, same as the
 // description generator above; this never writes to the database

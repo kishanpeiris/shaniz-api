@@ -136,7 +136,16 @@ async function storeBuffer(buffer, ext, contentType, resourceType) {
     const dataUri = `data:${contentType};base64,${buffer.toString('base64')}`
     const result = await cloudinary.uploader.upload(dataUri, {
       folder: 'shaniz',
-      public_id: filename.replace(`.${ext}`, ''),
+      // Images/videos: Cloudinary detects the real format itself and
+      // appends the right extension to the delivery URL regardless of
+      // public_id, so stripping it here just keeps the public_id tidy.
+      // Raw resources (PDFs) are different — Cloudinary does no format
+      // detection for `raw` and serves the public_id verbatim, so the
+      // extension has to actually be part of it or the delivered URL
+      // ends in nothing at all (which is what was happening: invoices
+      // downloaded with no file extension, so the OS/browser had no way
+      // to know they were PDFs).
+      public_id: resourceType === 'raw' ? filename : filename.replace(`.${ext}`, ''),
       resource_type: resourceType,
     })
     return result.secure_url

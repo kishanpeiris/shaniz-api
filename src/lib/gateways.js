@@ -13,7 +13,25 @@
 // docs, replace the fetch() call inside that gateway's function — the
 // rest of the app (orders, webhooks, emails) doesn't need to change.
 
-const isConfigured = (gateway) => {
+// Every real hosted-checkout flow needs TWO different callback URLs,
+// which are easy to conflate but serve different purposes:
+// - webhook_url: server-to-server, the gateway calls this directly and
+//   it's the reliable source of truth for "did this actually get paid"
+//   (src/routes/webhooks.routes.js already handles this).
+// - return_url: where the CUSTOMER'S BROWSER gets redirected back to
+//   once they finish on the gateway's own page — which, for a real
+//   Sri Lankan card payment, includes their bank's own OTP challenge
+//   screen (3-D Secure) *inside* that hosted flow. We never build any
+//   OTP UI ourselves; redirecting to the gateway's page is what hands
+//   the customer to their bank for that step, and this return_url is
+//   just where they land back on our site afterward. PaymentReturnPage
+//   then re-checks the order's real status (set by the webhook above,
+//   not by anything in this URL) rather than trusting query params the
+//   gateway attaches to the return URL, since exact param names differ
+//   per provider and aren't in the placeholder docs below yet.
+const returnUrl = (order) => `${process.env.FRONTEND_ORIGIN}/payment/return?order=${order.id}`
+
+export const isConfigured = (gateway) => {
   const map = {
     koko: process.env.KOKO_MERCHANT_ID && process.env.KOKO_API_SECRET,
     intpay: process.env.INTPAY_MERCHANT_ID && process.env.INTPAY_API_SECRET,
@@ -43,6 +61,7 @@ async function createKokoCheckout(order) {
       currency: 'LKR',
       order_id: order.id,
       webhook_url: `${process.env.PUBLIC_API_URL}/api/webhooks/koko`,
+      return_url: returnUrl(order),
     }),
   })
   if (!res.ok) throw new Error(`Koko checkout session failed (${res.status})`)
@@ -64,6 +83,7 @@ async function createIntPayCheckout(order) {
       currency: 'LKR',
       reference: order.id,
       webhook_url: `${process.env.PUBLIC_API_URL}/api/webhooks/intpay`,
+      return_url: returnUrl(order),
     }),
   })
   if (!res.ok) throw new Error(`IntPay checkout session failed (${res.status})`)
@@ -86,6 +106,7 @@ async function createDialogGenieCheckout(order) {
       currency: 'LKR',
       order_id: order.id,
       callback_url: `${process.env.PUBLIC_API_URL}/api/webhooks/dialog_genie`,
+      return_url: returnUrl(order),
     }),
   })
   if (!res.ok) throw new Error(`Dialog Genie payment request failed (${res.status})`)
@@ -117,3 +138,64 @@ export async function createCheckoutSession(gateway, order) {
 }
 
 export const GATEWAYS = ['koko', 'intpay', 'dialog_genie']
+
+// Placeholder refund calls — same "fill in the real request/response
+// shape once you have each gateway's actual API docs" situation as the
+// three createXCheckout functions above (see project-spec.md Section 4
+// and .env.example). Each takes the original gateway_txn_id (captured
+// when the payment first succeeded) since refunds are always issued
+// against a specific transaction, never just "this order" in isolation.
+async function refundKoko(order, amountLkr) {
+  const res = await fetch(`https://api.koko.lk/v1/refunds`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.KOKO_API_SECRET}` },
+    body: JSON.stringify({ transaction_id: order.gateway_txn_id, amount: amountLkr }),
+  })
+  if (!res.ok) throw new Error(`Koko refund request failed (${res.status})`)
+  const data = await res.json()
+  return data.refund_id
+}
+
+async function refundIntPay(order, amountLkr) {
+  const res = await fetch(`https://api.intpay.lk/v2/refund`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-API-Key': process.env.INTPAY_API_SECRET },
+    body: JSON.stringify({ reference: order.gateway_txn_id, amount: amountLkr }),
+  })
+  if (!res.ok) throw new Error(`IntPay refund request failed (${res.status})`)
+  const data = await res.json()
+  return data.refund_id
+}
+
+async function refundDialogGenie(order, amountLkr) {
+  const res = await fetch(`https://api.dialoggenie.lk/v1/refund`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Basic ${Buffer.from(
+        `${process.env.DIALOG_GENIE_MERCHANT_ID}:${process.env.DIALOG_GENIE_API_SECRET}`
+      ).toString('base64')}`,
+    },
+    body: JSON.stringify({ transaction_id: order.gateway_txn_id, amount: amountLkr }),
+  })
+  if (!res.ok) throw new Error(`Dialog Genie refund request failed (${res.status})`)
+  const data = await res.json()
+  return data.refund_id
+}
+
+const REFUNDERS = { koko: refundKoko, intpay: refundIntPay, dialog_genie: refundDialogGenie }
+
+// Unlike createCheckoutSession above, this does NOT quietly fall back to
+// a fake success if a live gateway's real call fails — that's fine for
+// "let's get to a checkout page" but never acceptable for "did the
+// customer actually get their money back." A sandbox (unconfigured)
+// gateway still simulates success immediately, same as sandbox-pay does
+// for the original charge, so admin approvals are fully testable before
+// any gateway goes live.
+export async function refundPayment(order, amountLkr) {
+  if (!isConfigured(order.gateway_used)) {
+    return { refunded: true, live: false, reference: `sandbox_refund_${Date.now()}` }
+  }
+  const reference = await REFUNDERS[order.gateway_used](order, amountLkr)
+  return { refunded: true, live: true, reference }
+}

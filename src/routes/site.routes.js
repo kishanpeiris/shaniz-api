@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { regionsForApi } from '../lib/delivery.js'
 import { sendContactMessageEmail } from '../lib/email.js'
+import { translateToEnglish } from '../lib/ai.js'
 import { logActivity } from '../lib/log.js'
 import { contactLimiter } from '../middleware/rateLimit.js'
 
@@ -70,6 +71,13 @@ const contactSchema = z.object({
   name: z.string().min(1, 'Please enter your name.').max(200),
   email: z.string().email('Please enter a valid email.'),
   message: z.string().min(1, 'Please enter a message.').max(4000),
+  // Which language the visitor had the site set to when they wrote
+  // this — sent by the frontend's language switcher state, not
+  // detected here. Only 'si'/'ta' trigger a translation attempt below;
+  // 'en' (or missing, for older/cached frontend builds) skips it
+  // entirely rather than needlessly round-tripping English through
+  // the translator.
+  language: z.enum(['en', 'si', 'ta']).optional(),
 })
 
 // Public: the homepage "Visit us" contact form (project-spec.md —
@@ -84,7 +92,14 @@ router.post('/contact', contactLimiter, async (req, res) => {
   const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'business_info'`)
   const toEmail = rows[0]?.value?.email || process.env.EMAIL_FROM
 
-  await sendContactMessageEmail(parsed.data, toEmail)
+  // Best-effort: translateToEnglish() never throws and returns null on
+  // any failure (missing API key, quota, network hiccup) — the
+  // business owner just gets the message without a translation
+  // underneath in that case, never a broken/blocked submission.
+  const englishTranslation =
+    parsed.data.language && parsed.data.language !== 'en' ? await translateToEnglish(parsed.data.message) : null
+
+  await sendContactMessageEmail(parsed.data, toEmail, englishTranslation)
   await logActivity(null, `contact.message_received (${parsed.data.email})`)
 
   res.status(201).json({ ok: true })

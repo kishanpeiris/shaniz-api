@@ -1,13 +1,14 @@
 import { Router } from 'express'
 import bcrypt from 'bcrypt'
 import { z } from 'zod'
-import { query } from '../db/pool.js'
+import { query, pool } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
 import { generateProductDescription, translateText } from '../lib/ai.js'
-import { sendNewAdminAlertEmail } from '../lib/email.js'
+import { sendNewAdminAlertEmail, sendRefundRequestResolvedEmail } from '../lib/email.js'
 import { getSuperadminEmails } from '../lib/notifications.js'
 import { toCsv } from '../lib/csv.js'
+import { refundPayment } from '../lib/gateways.js'
 
 const router = Router()
 
@@ -16,7 +17,7 @@ const router = Router()
 
 // ---- Dashboard (Section 8) ----
 router.get('/dashboard', async (req, res) => {
-  const [revenue, ordersByStatus, upcomingBookings, topProducts, lowStock, gatewaySplit, aov, signups, guestRatio, openFraudFlags, recentFraudFlags, failedAdminLogins, newAdmins] =
+  const [revenue, ordersByStatus, upcomingBookings, topProducts, lowStock, gatewaySplit, aov, signups, guestRatio, openFraudFlags, recentFraudFlags, failedAdminLogins, newAdmins, openRefundRequests] =
     await Promise.all([
       query(`SELECT date_trunc('day', created_at) AS day, SUM(total_lkr) AS revenue
              FROM orders WHERE status IN ('paid','shipped','completed') AND created_at > now() - interval '30 days'
@@ -42,6 +43,7 @@ router.get('/dashboard', async (req, res) => {
              WHERE la.success = FALSE AND u.role IN ('admin','superadmin')
                AND la.created_at > now() - interval '24 hours'`),
       query(`SELECT COUNT(*)::int AS n FROM users WHERE role IN ('admin','superadmin') AND created_at > now() - interval '7 days'`),
+      query(`SELECT COUNT(*)::int AS n FROM refund_requests WHERE status = 'pending'`),
     ])
 
   // Top products by revenue/units — computed in JS since items live in JSONB.
@@ -69,6 +71,7 @@ router.get('/dashboard', async (req, res) => {
     average_order_value_lkr: Number(aov.rows[0].aov ?? 0),
     new_signups_by_day: signups.rows,
     guest_vs_logged_in: guestRatio.rows[0],
+    open_refund_requests: openRefundRequests.rows[0].n,
     security: {
       open_fraud_flags: openFraudFlags.rows[0].n,
       recent_fraud_flags: recentFraudFlags.rows,
@@ -136,6 +139,116 @@ router.put('/fraud-flags/:id/resolve', async (req, res) => {
   if (!rows[0]) return res.status(404).json({ error: 'Flag not found.' })
   await logBoth(req.user.id, 'fraud.resolved', rows[0].order_id)
   res.json({ fraud_flag: rows[0] })
+})
+
+// ---- Refund/cancellation requests (customer-initiated, admin-resolved
+// — see the createRefundRequest flow in orders.routes.js) ----
+router.get('/refund-requests', async (req, res) => {
+  const onlyPending = req.query.status !== 'all'
+  const { rows } = await query(
+    `SELECT r.*, o.total_lkr, o.status AS order_status, o.gateway_used, o.delivery_method,
+            o.customer_first_name, o.customer_last_name
+     FROM refund_requests r JOIN orders o ON o.id = r.order_id
+     ${onlyPending ? "WHERE r.status = 'pending'" : ''}
+     ORDER BY r.created_at DESC LIMIT 200`
+  )
+  res.json({ refund_requests: rows })
+})
+
+const resolveRefundRequestSchema = z.object({
+  action: z.enum(['approve', 'reject']),
+  admin_note: z.string().max(1000).optional(),
+})
+
+router.put('/refund-requests/:id', async (req, res) => {
+  const parsed = resolveRefundRequestSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  const client = await pool.connect()
+  let order, updated
+  try {
+    await client.query('BEGIN')
+
+    // FOR UPDATE locks this row until COMMIT/ROLLBACK — closes a real
+    // race where two near-simultaneous approve clicks (a double-click,
+    // or two admin tabs open on the same request) could both read
+    // status='pending' before either writes, and both go on to issue a
+    // refund. The second transaction now blocks here until the first
+    // commits, and by then status is no longer 'pending'.
+    const { rows: existingRows } = await client.query(
+      'SELECT * FROM refund_requests WHERE id = $1 FOR UPDATE',
+      [req.params.id]
+    )
+    const request = existingRows[0]
+    if (!request) {
+      await client.query('ROLLBACK')
+      return res.status(404).json({ error: 'Request not found.' })
+    }
+    if (request.status !== 'pending') {
+      await client.query('ROLLBACK')
+      return res.status(409).json({ error: 'This request was already resolved.' })
+    }
+
+    const { rows: orderRows } = await client.query('SELECT * FROM orders WHERE id = $1', [request.order_id])
+    order = orderRows[0]
+
+    if (parsed.data.action === 'approve') {
+      // Only actually attempt a refund if money was taken in the first
+      // place — a cancellation on a still-'pending' (unpaid) order just
+      // needs the order marked cancelled, nothing to send back.
+      const moneyWasTaken = order.status !== 'pending'
+      if (moneyWasTaken) {
+        // Known edge case, not fully solved here: refundPayment (a real
+        // external API call once a gateway is live) happens inside this
+        // DB transaction. If it succeeds but something after it fails
+        // before COMMIT (e.g. a dropped DB connection), the transaction
+        // rolls back to "still pending" while the gateway has already
+        // refunded the money — a retry would then double-refund. Fully
+        // solving that needs an idempotency key recorded before the
+        // external call, which is more machinery than this project's
+        // current (sandbox-only, no live gateway yet) stage warrants;
+        // worth revisiting once a real gateway is actually live.
+        try {
+          await refundPayment(order, order.total_lkr)
+        } catch (err) {
+          // Deliberately does NOT mark anything as refunded if the real
+          // gateway call failed — see the comment on refundPayment in
+          // lib/gateways.js for why silently "succeeding" here would be
+          // far worse than just surfacing the error and letting the
+          // admin retry or handle it manually with the gateway directly.
+          await client.query('ROLLBACK')
+          return res.status(502).json({ error: `Refund could not be processed: ${err.message}` })
+        }
+      }
+      const newOrderStatus = moneyWasTaken ? 'refunded' : 'cancelled'
+      await client.query('UPDATE orders SET status = $1, updated_at = now() WHERE id = $2', [newOrderStatus, order.id])
+      order.status = newOrderStatus
+    }
+
+    const { rows: updatedRows } = await client.query(
+      `UPDATE refund_requests SET status = $1, admin_note = $2, resolved_by = $3, resolved_at = now()
+       WHERE id = $4 RETURNING *`,
+      [parsed.data.action === 'approve' ? 'approved' : 'rejected', parsed.data.admin_note ?? null, req.user.id, request.id]
+    )
+    updated = updatedRows[0]
+
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+
+  await logBoth(req.user.id, `refund_request.${updated.status}`, order.id, { admin_note: parsed.data.admin_note })
+
+  try {
+    await sendRefundRequestResolvedEmail(order, updated, updated.requested_by_email)
+  } catch (err) {
+    console.error('[refund-request] resolution email failed:', err.message)
+  }
+
+  res.json({ refund_request: updated })
 })
 
 // ---- Logs ----
@@ -534,6 +647,33 @@ router.put('/settings/booking-reminders', async (req, res) => {
   res.json({ booking_reminders: parsed.data })
 })
 
+// Order policies — currently just the return window, but its own
+// settings key (rather than cramming it into business_info) so it's
+// easy to add more order-related policies here later without the key
+// name becoming a misnomer. Read by returnEligible() in
+// orders.routes.js on every return-request check.
+const orderPoliciesSchema = z.object({
+  return_window_days: z.number().int().min(0).max(365),
+})
+
+router.get('/settings/order-policies', async (req, res) => {
+  const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'order_policies'`)
+  res.json({ order_policies: rows[0]?.value ?? { return_window_days: 14 } })
+})
+
+router.put('/settings/order-policies', async (req, res) => {
+  const parsed = orderPoliciesSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('order_policies', $1)
+     ON CONFLICT (key) DO UPDATE SET value = $1`,
+    [JSON.stringify(parsed.data)]
+  )
+  await logBoth(req.user.id, 'settings.order_policies_updated', null, parsed.data)
+  res.json({ order_policies: parsed.data })
+})
+
 // ---- Homepage content (basic CMS — Section 2's "Page customization UI") ----
 // Same "safe, low-risk fields only" reasoning as business info above:
 // this is marketing copy, not anything security-sensitive.
@@ -583,6 +723,7 @@ const homepageContentSchema = z.object({
   ritual_subtext_si: z.string().max(500).optional(),
   ritual_subtext_ta: z.string().max(500).optional(),
   ritual_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  ritual_video_background_url: z.union([z.string().url(), z.literal('')]).optional(),
   // Up to 9 process-video URLs (shown 3 at a time on the homepage, with
   // paging arrows past that — see RowCarousel.jsx). Capped server-side
   // too, not just in the admin UI, since this is a public-facing

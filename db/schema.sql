@@ -496,6 +496,32 @@ CREATE INDEX IF NOT EXISTS idx_activity_log_created_at ON activity_log (created_
 -- tripped, not that fraud is confirmed. Admins clear flags manually
 -- once reviewed.
 -- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS refund_requests (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id              UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  type                  TEXT NOT NULL CHECK (type IN ('cancellation', 'return')),
+  reason                TEXT NOT NULL,
+  status                TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  admin_note            TEXT,
+  -- Nullable for guest checkouts — requested_by_email is always set
+  -- (for both guests and logged-in customers) so there's always a
+  -- contact address for the resolution email regardless of which case
+  -- this is, without needing to re-join back to orders/users for it.
+  requested_by_user_id  UUID REFERENCES users(id) ON DELETE SET NULL,
+  requested_by_email    TEXT NOT NULL,
+  resolved_by           UUID REFERENCES users(id) ON DELETE SET NULL,
+  resolved_at           TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_refund_requests_order ON refund_requests (order_id);
+CREATE INDEX IF NOT EXISTS idx_refund_requests_pending ON refund_requests (status, created_at);
+-- Only one open request per order at a time — same partial-unique-index
+-- pattern as bookings' "no double-booking a cancelled slot" fix (see
+-- SETUP-AND-DEPLOYMENT.md's audit notes): a rejected/approved request
+-- doesn't block a future one on the same order, only a still-pending one does.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_refund_requests_one_pending_per_order
+  ON refund_requests (order_id) WHERE status = 'pending';
+
 CREATE TABLE IF NOT EXISTS fraud_flags (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id    UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,

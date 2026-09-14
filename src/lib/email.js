@@ -199,11 +199,26 @@ export async function sendLowStockAlertEmail(product, toEmail) {
 // validated (length + shape) by the zod schema in site.routes.js before
 // this is called; still escaped-free since this is an internal email,
 // not rendered back to any visitor.
-export async function sendContactMessageEmail({ name, email, message }, toEmail) {
+//
+// englishTranslation (optional): when the visitor had the site set to
+// Sinhala or Tamil, site.routes.js attempts an AI translation of their
+// message before calling this — shown here as a clearly-labeled
+// addition above the original, never replacing it, so nothing is lost
+// if the translation is imperfect.
+export async function sendContactMessageEmail({ name, email, message }, toEmail, englishTranslation) {
   const html = layout(
     'New Contact Form Message',
     `
       <p><strong>From:</strong> ${name} (${email})</p>
+      ${
+        englishTranslation
+          ? `<p style="background:#f6f1e4; border-left:3px solid #b8934a; padding:10px 14px; margin:14px 0;">
+               <strong>English translation:</strong><br/>
+               <span style="white-space: pre-wrap;">${englishTranslation}</span>
+             </p>
+             <p style="font-size:12px; color:#8a8672; margin-bottom:4px;">Original message:</p>`
+          : ''
+      }
       <p style="white-space: pre-wrap;">${message}</p>
     `
   )
@@ -217,4 +232,41 @@ export async function sendInvoiceEmail(order, toEmail, pdfUrl) {
      ${pdfUrl ? `<p><a href="${pdfUrl}" style="color:#2b3a2f;">Download invoice (PDF)</a></p>` : ''}`
   )
   return send({ to: toEmail, subject: `Invoice — ${order.id.slice(0, 8)}`, html })
+}
+
+// Order cancellation/return requests — a customer's request never
+// changes the order's status by itself (see the eligibility + creation
+// logic in orders.routes.js); an admin approving or rejecting it is
+// what actually does that. These two emails cover the two ends of that
+// flow: telling the admin a request needs review, and telling the
+// customer what was decided.
+export async function sendRefundRequestReceivedEmail(order, request, toEmail) {
+  const html = layout(
+    request.type === 'cancellation' ? 'Cancellation Requested' : 'Return Requested',
+    `
+      <p>Order <strong>${order.id.slice(0, 8)}</strong> (Rs. ${Number(order.total_lkr).toLocaleString()}) — a customer
+      has requested a ${request.type === 'cancellation' ? 'cancellation' : 'return/refund'}.</p>
+      <p style="font-size:13px; color:#5c5949;"><strong>Their reason:</strong> ${request.reason}</p>
+      <p style="font-size:13px; color:#5c5949;">Review it from Admin → Refund Requests.</p>
+    `
+  )
+  return send({ to: toEmail, subject: `${request.type === 'cancellation' ? 'Cancellation' : 'Return'} requested — ${order.id.slice(0, 8)}`, html })
+}
+
+export async function sendRefundRequestResolvedEmail(order, request, toEmail) {
+  const approved = request.status === 'approved'
+  const html = layout(
+    approved ? 'Your Request Was Approved' : 'Update On Your Request',
+    `
+      <p>Your ${request.type === 'cancellation' ? 'cancellation' : 'return/refund'} request for order
+      <strong>${order.id.slice(0, 8)}</strong> has been ${approved ? 'approved' : 'declined'}.</p>
+      ${
+        approved && request.type !== 'cancellation'
+          ? `<p>Rs. ${Number(order.total_lkr).toLocaleString()} will be refunded to your original payment method.</p>`
+          : ''
+      }
+      ${request.admin_note ? `<p style="font-size:13px; color:#5c5949;"><strong>Note from us:</strong> ${request.admin_note}</p>` : ''}
+    `
+  )
+  return send({ to: toEmail, subject: `${approved ? 'Approved' : 'Update'}: your request for order ${order.id.slice(0, 8)}`, html })
 }
