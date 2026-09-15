@@ -626,3 +626,32 @@ CREATE TABLE IF NOT EXISTS translations (
 --   $$DELETE FROM audit_log WHERE created_at < now() - interval '30 days'$$);
 -- SELECT cron.schedule('purge-activity-log', '0 3 * * *',
 --   $$DELETE FROM activity_log WHERE created_at < now() - interval '15 days'$$);
+
+-- ---------------------------------------------------------------------
+-- Delivery regions & fees (admin-editable). Previously hardcoded in
+-- src/lib/delivery.js; moved into the database so admins can add,
+-- rename, re-price, or remove delivery zones from the admin panel
+-- without a code deploy. Seeded once from the original hardcoded
+-- values below — ON CONFLICT DO NOTHING means re-running this file
+-- (npm run db:migrate) never overwrites an admin's later edits.
+-- `id` is a short slug (e.g. 'colombo_main') because it's stored on
+-- each order's delivery_region column as a stable reference — renaming
+-- a region's label/fee later never breaks historical orders.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS delivery_regions (
+  id          TEXT PRIMARY KEY,
+  label       TEXT NOT NULL,
+  fee_lkr     NUMERIC(10,2) NOT NULL DEFAULT 0,
+  example     TEXT,
+  sort_order  INTEGER NOT NULL DEFAULT 0,
+  is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO delivery_regions (id, label, fee_lkr, example, sort_order) VALUES
+  ('colombo_main', 'Colombo (Main City — Colombo 1–15)', 350, 'Colombo Fort, Bambalapitiya, Wellawatte, Borella', 1),
+  ('colombo_suburbs', 'Colombo Suburbs', 450, 'Dehiwala, Nugegoda, Kotte, Maharagama, Rajagiriya', 2),
+  ('outer_suburbs', 'Outer Suburbs', 550, 'Kaduwela, Homagama, Ja-Ela, Wattala, Kesbewa', 3),
+  ('outside_colombo', 'Outside Colombo (Island-wide)', 750, 'Kandy, Galle, Jaffna, Negombo, and everywhere else', 4)
+ON CONFLICT (id) DO NOTHING;

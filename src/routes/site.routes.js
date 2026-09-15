@@ -5,9 +5,32 @@ import { regionsForApi } from '../lib/delivery.js'
 import { sendContactMessageEmail } from '../lib/email.js'
 import { translateToEnglish } from '../lib/ai.js'
 import { logActivity } from '../lib/log.js'
-import { contactLimiter } from '../middleware/rateLimit.js'
+import { contactLimiter, addressAutocompleteLimiter } from '../middleware/rateLimit.js'
+import { autocompleteAddress } from '../lib/geocode.js'
 
 const router = Router()
+
+// Public: "Address line 1" suggestions while typing, at checkout and on
+// the account page's saved-address form. Never a hard failure for the
+// person typing — if both geocoding providers are down or the query is
+// too short to be useful, this just returns an empty suggestion list
+// and normal free-text typing keeps working exactly as before.
+router.get('/address-autocomplete', addressAutocompleteLimiter, async (req, res) => {
+  const parsed = z.string().trim().min(3).max(200).safeParse(req.query.q)
+  if (!parsed.success) return res.json({ suggestions: [] })
+
+  try {
+    const results = await autocompleteAddress(parsed.data)
+    const suggestions = (results || [])
+      .map((r) => r.display_name)
+      .filter(Boolean)
+      .slice(0, 6)
+    res.json({ suggestions })
+  } catch (err) {
+    console.error('[address-autocomplete] failed:', err.message)
+    res.json({ suggestions: [] })
+  }
+})
 
 // Public: the front-end polls this to show the maintenance placeholder
 // page or the "upcoming outage" banner — no manual banner editing needed

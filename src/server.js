@@ -18,6 +18,7 @@ import { attachUser, requireRole } from './middleware/auth.js'
 import { requireCsrfHeader } from './middleware/csrf.js'
 import { apiLimiter } from './middleware/rateLimit.js'
 import { startLogPurgeJob } from './lib/logPurge.js'
+import { loadRegions } from './lib/delivery.js'
 import { startBookingReminderJob } from './lib/bookingReminders.js'
 
 import authRoutes from './routes/auth.routes.js'
@@ -105,8 +106,13 @@ app.use((err, req, res, next) => {
 })
 
 const port = process.env.PORT || 4000
-app.listen(port, () => {
-  console.log(`Shani'z API listening on http://localhost:${port}`)
-  startLogPurgeJob()
-  startBookingReminderJob()
+// Load delivery region rates from the database into memory before
+// accepting traffic, so the very first checkout request already sees
+// current rates instead of the hardcoded fallback.
+loadRegions().then(() => {
+  app.listen(port, () => {
+    console.log(`Shani'z API listening on http://localhost:${port}`)
+    startLogPurgeJob()
+    startBookingReminderJob()
+  })
 })

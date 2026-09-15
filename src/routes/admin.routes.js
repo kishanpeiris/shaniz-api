@@ -9,6 +9,9 @@ import { sendNewAdminAlertEmail, sendRefundRequestResolvedEmail } from '../lib/e
 import { getSuperadminEmails } from '../lib/notifications.js'
 import { toCsv } from '../lib/csv.js'
 import { refundPayment } from '../lib/gateways.js'
+import { issueVerificationEmail } from './auth.routes.js'
+import { adminResendVerificationLimiter } from '../middleware/rateLimit.js'
+import { loadRegions } from '../lib/delivery.js'
 
 const router = Router()
 
@@ -468,6 +471,27 @@ router.put('/customers/:id/disabled', async (req, res) => {
   res.json({ customer: rows[0] })
 })
 
+// Lets an admin re-send the "confirm your email" link on a customer's
+// behalf — e.g. it landed in spam, they mistyped their address the first
+// time, or the original 24-hour link expired. Reuses the exact same
+// token-issuing helper as the customer's own self-service resend, so the
+// link works identically either way.
+router.post('/customers/:id/resend-verification', adminResendVerificationLimiter, async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, name, email, email_verified FROM users WHERE id = $1 AND role = 'customer'`,
+    [req.params.id]
+  )
+  const customer = rows[0]
+  if (!customer) return res.status(404).json({ error: 'Customer not found.' })
+  if (customer.email_verified) {
+    return res.json({ ok: true, message: 'This customer is already verified.' })
+  }
+
+  await issueVerificationEmail(customer)
+  await logBoth(req.user.id, 'customer.verification_resent', customer.id)
+  res.json({ ok: true, message: `Verification email sent to ${customer.email}.` })
+})
+
 // ---- Blacklisted emails (registration overhaul) ----
 // Blocks specific addresses from ever registering (spam/abuse). Does NOT
 // touch any existing account — it only affects future /api/auth/register
@@ -811,6 +835,125 @@ router.put('/maintenance-mode', async (req, res) => {
   await query(`UPDATE site_settings SET value = $1 WHERE key = 'maintenance_mode'`, [JSON.stringify(value)])
   await logBoth(req.user.id, parsed.data.enabled ? 'maintenance.scheduled' : 'maintenance.disabled')
   res.json({ maintenance_schedule: value })
+})
+
+// ---- Delivery regions & fees (Settings → Delivery) ----
+// Lets an admin add, re-price, rename, or remove Sri Lanka delivery
+// zones without a code deploy — see db/schema.sql for the table and
+// src/lib/delivery.js for how checkout reads these rates.
+
+function slugify(label) {
+  return label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60)
+}
+
+// Turns "Colombo Suburbs" into a free id, adding _2/_3/... if that slug
+// is already taken — so an admin never has to think about ids at all,
+// they just type a label.
+async function uniqueRegionId(label) {
+  const base = slugify(label) || 'region'
+  let candidate = base
+  let n = 2
+  while (true) {
+    const { rows } = await query('SELECT 1 FROM delivery_regions WHERE id = $1', [candidate])
+    if (rows.length === 0) return candidate
+    candidate = `${base}_${n}`
+    n += 1
+  }
+}
+
+router.get('/delivery-regions', async (req, res) => {
+  const { rows } = await query(
+    `SELECT id, label, fee_lkr, example, sort_order, is_active FROM delivery_regions
+     ORDER BY sort_order ASC, label ASC`
+  )
+  res.json({ regions: rows.map((r) => ({ ...r, fee_lkr: Number(r.fee_lkr) })) })
+})
+
+const regionInputSchema = z.object({
+  label: z.string().min(1).max(150),
+  fee_lkr: z.number().min(0),
+  example: z.string().max(300).optional(),
+  sort_order: z.number().int().optional(),
+})
+
+router.post('/delivery-regions', async (req, res) => {
+  const parsed = regionInputSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const { label, fee_lkr, example, sort_order } = parsed.data
+
+  const id = await uniqueRegionId(label)
+  const { rows } = await query(
+    `INSERT INTO delivery_regions (id, label, fee_lkr, example, sort_order)
+     VALUES ($1, $2, $3, $4, COALESCE($5, 0)) RETURNING *`,
+    [id, label, fee_lkr, example ?? null, sort_order ?? null]
+  )
+  await loadRegions()
+  await logBoth(req.user.id, 'delivery_region.created', id)
+  res.status(201).json({ region: { ...rows[0], fee_lkr: Number(rows[0].fee_lkr) } })
+})
+
+const regionUpdateSchema = regionInputSchema.partial().extend({
+  is_active: z.boolean().optional(),
+})
+
+router.put('/delivery-regions/:id', async (req, res) => {
+  const parsed = regionUpdateSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const fields = parsed.data
+
+  // If this update would leave zero active regions, checkout's "Home
+  // Delivery" option would have nothing to offer — block it rather
+  // than silently breaking checkout.
+  if (fields.is_active === false) {
+    const { rows: activeCount } = await query(
+      `SELECT COUNT(*) FROM delivery_regions WHERE is_active = TRUE AND id != $1`,
+      [req.params.id]
+    )
+    if (Number(activeCount[0].count) === 0) {
+      return res.status(400).json({ error: 'At least one delivery region must stay active.' })
+    }
+  }
+
+  const sets = []
+  const values = []
+  let i = 1
+  for (const [key, val] of Object.entries(fields)) {
+    sets.push(`${key} = $${i}`)
+    values.push(val)
+    i += 1
+  }
+  if (sets.length === 0) return res.status(400).json({ error: 'Nothing to update.' })
+  sets.push(`updated_at = now()`)
+  values.push(req.params.id)
+
+  const { rows } = await query(
+    `UPDATE delivery_regions SET ${sets.join(', ')} WHERE id = $${i} RETURNING *`,
+    values
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Delivery region not found.' })
+  await loadRegions()
+  await logBoth(req.user.id, 'delivery_region.updated', req.params.id)
+  res.json({ region: { ...rows[0], fee_lkr: Number(rows[0].fee_lkr) } })
+})
+
+router.delete('/delivery-regions/:id', async (req, res) => {
+  const { rows: activeCount } = await query(
+    `SELECT COUNT(*) FROM delivery_regions WHERE is_active = TRUE AND id != $1`,
+    [req.params.id]
+  )
+  if (Number(activeCount[0].count) === 0) {
+    return res.status(400).json({ error: 'At least one delivery region must remain — edit or add another before deleting this one.' })
+  }
+
+  const { rows } = await query('DELETE FROM delivery_regions WHERE id = $1 RETURNING id', [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Delivery region not found.' })
+  await loadRegions()
+  await logBoth(req.user.id, 'delivery_region.deleted', req.params.id)
+  res.json({ ok: true })
 })
 
 export default router

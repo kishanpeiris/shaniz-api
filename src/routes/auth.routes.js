@@ -33,7 +33,7 @@ const registerSchema = z.object({
 // (same pattern as the password-reset flow below) and emails the raw
 // token to the user. Returns nothing — the email send is fire-and-forget
 // from the caller's perspective, matching how password reset works.
-async function issueVerificationEmail(user) {
+export async function issueVerificationEmail(user) {
   const rawToken = crypto.randomBytes(32).toString('hex')
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000) // 24 hours
