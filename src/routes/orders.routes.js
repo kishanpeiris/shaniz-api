@@ -63,7 +63,7 @@ const addressInputSchema = z.object({
 const orderSchema = z
   .object({
     items: z.array(lineItemSchema).min(1),
-    gateway: z.enum(['koko', 'intpay', 'dialog_genie']),
+    gateway: z.enum(['koko', 'intpay', 'payhere']),
     guest_email: z.string().email().optional(),
 
     // Contact — required for everyone, guest or logged-in, per the
@@ -83,8 +83,15 @@ const orderSchema = z
     billing_address_id: z.string().uuid().optional(),
     billing_address: addressInputSchema.optional(),
 
-    // Only meaningful for card gateways (dialog_genie) with a logged-in
+    // Only meaningful for the card gateway (payhere) with a logged-in
     // customer — see POST /:id/sandbox-pay for where this is fulfilled.
+    // Note: this only ever records that the customer *asked* to save
+    // their card (save_card_requested, below) — it doesn't yet actually
+    // tokenize/reuse a card via PayHere's Preapproval API, which is a
+    // separate, bigger integration (customer must complete a
+    // "preapproval" transaction, PayHere returns a reusable token you
+    // store and charge later via their Charging API). Worth a follow-up
+    // task once basic checkout is live and working.
     save_card: z.boolean().optional().default(false),
   })
   .refine((d) => d.delivery_method !== 'delivery' || isValidRegion(d.delivery_region), {
@@ -262,7 +269,7 @@ router.post('/', async (req, res) => {
         fee,
         shippingSnapshot ? JSON.stringify(shippingSnapshot) : null,
         billingSnapshot ? JSON.stringify(billingSnapshot) : null,
-        Boolean(d.save_card && userId && d.gateway === 'dialog_genie'),
+        Boolean(d.save_card && userId && d.gateway === 'payhere'),
         req.ip,
       ]
     )
@@ -312,7 +319,7 @@ router.post('/', async (req, res) => {
       console.error('[low-stock-alert] failed:', err.message)
     )
 
-    // Once KOKO_/INTPAY_/DIALOG_GENIE_ env vars are set (project-spec.md
+    // Once KOKO_/INTPAY_/PAYHERE_ env vars are set (project-spec.md
     // Section 4), this calls the real gateway; until then it returns a
     // sandbox mock URL, and the frontend's /payment page simulates the
     // hosted-checkout flow itself via POST /:id/sandbox-pay below.
@@ -321,6 +328,12 @@ router.post('/', async (req, res) => {
     res.status(201).json({
       order,
       checkout_redirect_url: session.url,
+      // PayHere needs a real form POST, not a plain redirect — these are
+      // null for Koko/IntPay (and the sandbox mock), so the frontend's
+      // existing window.location redirect keeps working unchanged for
+      // those, only branching to the new hidden-form submit for PayHere.
+      checkout_method: session.method,
+      checkout_fields: session.fields,
       gateway_live: session.live,
     })
   } catch (err) {
@@ -564,7 +577,7 @@ router.post('/:id/sandbox-pay', async (req, res) => {
   // Blocks this endpoint on a real production deployment by default —
   // the only existing guard below (`session.live`) only fires once a
   // *specific* gateway has live credentials configured, which means as
-  // long as none of Koko/IntPay/Dialog Genie are live yet, this endpoint
+  // long as none of Koko/IntPay/PayHere are live yet, this endpoint
   // stays wide open on the real public site: anyone can "pay" for a
   // real order without any money changing hands. That's exactly the
   // gap this closes. Set ENABLE_SANDBOX_IN_PRODUCTION=true as a

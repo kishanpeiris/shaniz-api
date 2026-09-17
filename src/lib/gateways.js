@@ -1,17 +1,19 @@
 // Payment gateway abstraction — project-spec.md Section 4.
 //
-// Each of Koko, IntPay, and Dialog Genie exposes a hosted-checkout flow:
-// you create a "checkout session" server-side, redirect the customer to
-// the URL it returns, and the gateway calls your webhook
-// (src/routes/webhooks.routes.js) when payment succeeds or fails.
+// Koko and IntPay expose a hosted-checkout flow: you create a "checkout
+// session" server-side, redirect the customer to the URL it returns, and
+// the gateway calls your webhook (src/routes/webhooks.routes.js) when
+// payment succeeds or fails. Their exact request/response shape below is
+// still a best-effort placeholder — replace the fetch() call inside each
+// once you have their real sandbox docs; nothing else needs to change.
 //
-// The exact request/response shape below is a best-effort placeholder —
-// every gateway's real API differs, and their docs only arrive once you
-// register as a merchant and get sandbox credentials (spec Section 4,
-// steps 1-3). Until then, each gateway falls back to a sandbox mock URL
-// so checkout keeps working end-to-end in dev. Once you have real sandbox
-// docs, replace the fetch() call inside that gateway's function — the
-// rest of the app (orders, webhooks, emails) doesn't need to change.
+// PayHere (the "Credit / Debit Card" option, replacing the earlier
+// Dialog Genie placeholder) is real and fully implemented below — it's
+// publicly documented, Central Bank of Sri Lanka approved, and doesn't
+// need placeholder credentials to work in sandbox mode (PayHere's own
+// sandbox is free, no merchant approval wait). See PAYHERE_MERCHANT_ID /
+// PAYHERE_MERCHANT_SECRET in .env.example.
+import crypto from 'crypto'
 
 // Every real hosted-checkout flow needs TWO different callback URLs,
 // which are easy to conflate but serve different purposes:
@@ -35,7 +37,7 @@ export const isConfigured = (gateway) => {
   const map = {
     koko: process.env.KOKO_MERCHANT_ID && process.env.KOKO_API_SECRET,
     intpay: process.env.INTPAY_MERCHANT_ID && process.env.INTPAY_API_SECRET,
-    dialog_genie: process.env.DIALOG_GENIE_MERCHANT_ID && process.env.DIALOG_GENIE_API_SECRET,
+    payhere: process.env.PAYHERE_MERCHANT_ID && process.env.PAYHERE_MERCHANT_SECRET,
   }
   return Boolean(map[gateway])
 }
@@ -91,60 +93,106 @@ async function createIntPayCheckout(order) {
   return data.redirect_url
 }
 
-async function createDialogGenieCheckout(order) {
-  // TODO: replace with Dialog Genie's real endpoint — same caveat as above.
-  const res = await fetch('https://api.dialoggenie.example/v1/payment-requests', {
+// PayHere's "Checkout API" (https://support.payhere.lk/api-&-mobile-sdk)
+// is NOT a "call an endpoint, get back a URL" flow like the two above —
+// there's no session-creation API call at all. Instead, the customer's
+// BROWSER submits an HTML form (fields below) directly to PayHere's own
+// checkout page via POST, signed with a hash so PayHere can trust the
+// amount wasn't tampered with in the browser. That's why this returns an
+// object (url + method + fields) instead of a bare URL string — the
+// frontend builds and auto-submits that exact form (see
+// PayHereRedirectForm in CheckoutPage.jsx) rather than doing a plain
+// window.location redirect like it does for Koko/IntPay.
+function payhereCheckoutUrl() {
+  return process.env.PAYHERE_MODE === 'live'
+    ? 'https://www.payhere.lk/pay/checkout'
+    : 'https://sandbox.payhere.lk/pay/checkout'
+}
+
+// PayHere's documented hash formula: MD5(merchant_id + order_id + amount
+// + currency + MD5(merchant_secret)-uppercased) - uppercased. Sri Lanka
+// Post... no wait, PayHere, not the post office — this is the exact
+// formula from their "Checkout API" docs, not a guess like the other
+// two gateways' placeholders.
+function payhereHash(merchantId, orderId, amount, currency, merchantSecret) {
+  const secretHash = crypto.createHash('md5').update(merchantSecret).digest('hex').toUpperCase()
+  const signature = `${merchantId}${orderId}${amount}${currency}${secretHash}`
+  return crypto.createHash('md5').update(signature).digest('hex').toUpperCase()
+}
+
+async function createPayHereCheckout(order) {
+  const merchantId = process.env.PAYHERE_MERCHANT_ID
+  const merchantSecret = process.env.PAYHERE_MERCHANT_SECRET
+  // PayHere requires exactly 2 decimal places, no thousands separator
+  // (e.g. "2200.00", never "2,200.00" or "2200").
+  const amount = Number(order.total_lkr).toFixed(2)
+  const currency = 'LKR'
+  // Pickup orders have no shipping_address — PayHere still requires an
+  // address/city, so billing (always collected) is the fallback, with a
+  // last-resort placeholder so a real gap in the data never blocks
+  // checkout outright (better a slightly wrong city field on PayHere's
+  // side than a broken checkout).
+  const address = order.shipping_address || order.billing_address || {}
+
+  return {
+    url: payhereCheckoutUrl(),
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Basic ${Buffer.from(
-        `${process.env.DIALOG_GENIE_MERCHANT_ID}:${process.env.DIALOG_GENIE_API_SECRET}`
-      ).toString('base64')}`,
-    },
-    body: JSON.stringify({
-      amount: order.total_lkr,
-      currency: 'LKR',
-      order_id: order.id,
-      callback_url: `${process.env.PUBLIC_API_URL}/api/webhooks/dialog_genie`,
+    fields: {
+      merchant_id: merchantId,
       return_url: returnUrl(order),
-    }),
-  })
-  if (!res.ok) throw new Error(`Dialog Genie payment request failed (${res.status})`)
-  const data = await res.json()
-  return data.payment_url
+      cancel_url: returnUrl(order),
+      notify_url: `${process.env.PUBLIC_API_URL}/api/webhooks/payhere`,
+      order_id: order.id,
+      items: `Shani'z order ${order.id}`,
+      currency,
+      amount,
+      first_name: order.customer_first_name || 'Customer',
+      last_name: order.customer_last_name || '',
+      email: order.customer_email || '',
+      phone: order.customer_phone || '',
+      address: address.line1 || 'Not provided',
+      city: address.city || 'Colombo',
+      country: 'Sri Lanka',
+      hash: payhereHash(merchantId, order.id, amount, currency, merchantSecret),
+    },
+  }
 }
 
 const CREATORS = {
   koko: createKokoCheckout,
   intpay: createIntPayCheckout,
-  dialog_genie: createDialogGenieCheckout,
+  payhere: createPayHereCheckout,
 }
 
-// Returns the URL to redirect the customer to. Falls back to a sandbox
-// mock URL if that gateway's credentials aren't set yet, or if the real
-// call fails for any reason (so a placeholder-API typo never blocks
-// checkout in dev — it just doesn't process a real payment).
+// Returns what the frontend needs to send the customer to the gateway.
+// Koko/IntPay resolve to a plain URL string (simple GET redirect);
+// PayHere resolves to { url, method: 'POST', fields } since it needs a
+// real form submission, not a redirect — createCheckoutSession normalizes
+// both shapes into one consistent return value either way. Falls back to
+// a sandbox mock URL if that gateway's credentials aren't set yet, or if
+// the real call fails for any reason (so a placeholder-API typo never
+// blocks checkout in dev — it just doesn't process a real payment).
 export async function createCheckoutSession(gateway, order) {
   if (!isConfigured(gateway)) {
-    return { url: mockCheckoutUrl(gateway, order), live: false }
+    return { url: mockCheckoutUrl(gateway, order), method: 'GET', fields: null, live: false }
   }
   try {
-    const url = await CREATORS[gateway](order)
-    return { url, live: true }
+    const result = await CREATORS[gateway](order)
+    return typeof result === 'string'
+      ? { url: result, method: 'GET', fields: null, live: true }
+      : { method: 'GET', fields: null, ...result, live: true }
   } catch (err) {
     console.error(`${gateway} checkout session error, falling back to sandbox mock:`, err.message)
-    return { url: mockCheckoutUrl(gateway, order), live: false }
+    return { url: mockCheckoutUrl(gateway, order), method: 'GET', fields: null, live: false }
   }
 }
 
-export const GATEWAYS = ['koko', 'intpay', 'dialog_genie']
+export const GATEWAYS = ['koko', 'intpay', 'payhere']
 
-// Placeholder refund calls — same "fill in the real request/response
-// shape once you have each gateway's actual API docs" situation as the
-// three createXCheckout functions above (see project-spec.md Section 4
-// and .env.example). Each takes the original gateway_txn_id (captured
-// when the payment first succeeded) since refunds are always issued
-// against a specific transaction, never just "this order" in isolation.
+// Placeholder refund calls for Koko/IntPay — same "fill in the real
+// request/response shape once you have their actual API docs" situation
+// as the two createXCheckout functions above. PayHere's refund (below)
+// is real, using their documented Retrieval/Refund API.
 async function refundKoko(order, amountLkr) {
   const res = await fetch(`https://api.koko.lk/v1/refunds`, {
     method: 'POST',
@@ -167,23 +215,45 @@ async function refundIntPay(order, amountLkr) {
   return data.refund_id
 }
 
-async function refundDialogGenie(order, amountLkr) {
-  const res = await fetch(`https://api.dialoggenie.lk/v1/refund`, {
+// PayHere refunds go through their Retrieval API's /merchant/v1/refund
+// endpoint, authenticated with an OAuth app token (App ID + App Secret —
+// a SEPARATE credential pair from the Merchant ID/Secret used for
+// checkout above, generated from PayHere's dashboard under Settings >
+// Business Apps with the "Payment Retrieval API" permission ticked).
+// Falls back to the same "not configured" path as the other gateways if
+// those app-level credentials haven't been set up yet — the storefront
+// keeps working either way, only the admin's refund button is affected.
+async function payhereAppToken() {
+  const res = await fetch('https://sandbox.payhere.lk/merchant/v1/oauth/token', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Basic ${Buffer.from(
-        `${process.env.DIALOG_GENIE_MERCHANT_ID}:${process.env.DIALOG_GENIE_API_SECRET}`
-      ).toString('base64')}`,
-    },
-    body: JSON.stringify({ transaction_id: order.gateway_txn_id, amount: amountLkr }),
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: process.env.PAYHERE_APP_ID,
+      client_secret: process.env.PAYHERE_APP_SECRET,
+    }),
   })
-  if (!res.ok) throw new Error(`Dialog Genie refund request failed (${res.status})`)
+  if (!res.ok) throw new Error(`PayHere OAuth token request failed (${res.status})`)
   const data = await res.json()
-  return data.refund_id
+  return data.access_token
 }
 
-const REFUNDERS = { koko: refundKoko, intpay: refundIntPay, dialog_genie: refundDialogGenie }
+async function refundPayHere(order, amountLkr) {
+  if (!process.env.PAYHERE_APP_ID || !process.env.PAYHERE_APP_SECRET) {
+    throw new Error('PayHere refunds need PAYHERE_APP_ID/PAYHERE_APP_SECRET (a Business App, separate from the checkout Merchant ID/Secret) — see .env.example.')
+  }
+  const token = await payhereAppToken()
+  const res = await fetch('https://sandbox.payhere.lk/merchant/v1/refund', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ payment_id: order.gateway_txn_id, description: `Refund for order ${order.id}` }),
+  })
+  if (!res.ok) throw new Error(`PayHere refund request failed (${res.status})`)
+  const data = await res.json()
+  return data.data?.refund_id ?? order.gateway_txn_id
+}
+
+const REFUNDERS = { koko: refundKoko, intpay: refundIntPay, payhere: refundPayHere }
 
 // Unlike createCheckoutSession above, this does NOT quietly fall back to
 // a fake success if a live gateway's real call fails — that's fine for

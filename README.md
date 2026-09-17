@@ -266,7 +266,7 @@ see project-spec.md Section 4), but it's easier to create them up front:
 | [Cloudinary](https://cloudinary.com) | product image storage | Yes |
 | [Resend](https://resend.com) | transactional email | Yes (100/day) |
 | A domain registrar (Namecheap, GoDaddy, etc.) | your custom domain | — |
-| Koko / IntPay / Dialog Genie | payment processing | Merchant sign-up required — see Section 4 of project-spec.md |
+| Koko / IntPay / PayHere | payment processing | Merchant sign-up required — see Section 4 of project-spec.md |
 
 ### 2. Push both repos to GitHub
 
@@ -390,7 +390,7 @@ bookings, and the admin panel.
    settings) instead of the host's default subdomain — tidier, and some
    payment gateways prefer webhook URLs on your own domain.
 
-### 9. Payment gateways (Koko / IntPay / Dialog Genie)
+### 9. Payment gateways (Koko / IntPay / PayHere)
 
 Per project-spec.md Section 4: register as a merchant with each gateway
 you want to support, complete their KYC/verification, and they'll give

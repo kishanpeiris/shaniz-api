@@ -138,7 +138,7 @@ END $$;
 CREATE TABLE IF NOT EXISTS payment_methods (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  gateway    TEXT NOT NULL CHECK (gateway IN ('koko', 'intpay', 'dialog_genie')),
+  gateway    TEXT NOT NULL CHECK (gateway IN ('koko', 'intpay', 'dialog_genie', 'payhere')),
   token      TEXT NOT NULL, -- gateway-issued token, never a raw card number
   brand      TEXT, -- 'visa' | 'mastercard' | null (only meaningful for card gateways)
   last4      TEXT,
@@ -344,7 +344,7 @@ CREATE TABLE IF NOT EXISTS orders (
   total_lkr      NUMERIC(12,2) NOT NULL CHECK (total_lkr >= 0),
   status         TEXT NOT NULL DEFAULT 'pending'
                  CHECK (status IN ('pending', 'paid', 'shipped', 'completed', 'cancelled', 'refunded')),
-  gateway_used   TEXT CHECK (gateway_used IN ('koko', 'intpay', 'dialog_genie')),
+  gateway_used   TEXT CHECK (gateway_used IN ('koko', 'intpay', 'dialog_genie', 'payhere')),
   gateway_txn_id TEXT,
   shipping_address_id UUID REFERENCES addresses(id),
   -- Customer contact + delivery details, captured at checkout for BOTH
@@ -655,3 +655,62 @@ INSERT INTO delivery_regions (id, label, fee_lkr, example, sort_order) VALUES
   ('outer_suburbs', 'Outer Suburbs', 550, 'Kaduwela, Homagama, Ja-Ela, Wattala, Kesbewa', 3),
   ('outside_colombo', 'Outside Colombo (Island-wide)', 750, 'Kandy, Galle, Jaffna, Negombo, and everywhere else', 4)
 ON CONFLICT (id) DO NOTHING;
+
+-- Fills in Sinhala/Tamil for the homepage content above, for anyone
+-- upgrading from before per-language homepage content existed. AI-
+-- assisted starting translations (same as the admin's own "Auto-
+-- translate" button) — worth a native-speaker read-through, same as
+-- that button's own on-screen disclaimer says. Merged in with the
+-- existing keys taking priority (value on the right of ||), so this
+-- is safe to re-run and never overwrites an admin's own edits, even
+-- if they've since changed these translations themselves.
+UPDATE site_settings
+SET value = ('{
+  "hero_eyebrow_si": "සුළු තොග වශයෙන් · ශ්‍රී ලාංකික වගාව",
+  "hero_eyebrow_ta": "சிறு தொகுதி · இலங்கையில் விளைந்தது",
+  "hero_headline_si": "Ceylon හි ශාක චාරිත්‍රය, අතින් බෝතල් කළා.",
+  "hero_headline_ta": "Ceylon-இன் மூலிகை சடங்கு, கையால் பாட்டிலிடப்பட்டது.",
+  "hero_subtext_si": "නෙල්ලි, කරපිංචා, කොහොඹ සහ රෝස්මරී — අපේ ආච්චිලා කළ ආකාරයටම මිශ්‍ර කර ඇත, රැකවරණය දැනෙන කෙස් සඳහා.",
+  "hero_subtext_ta": "நெல்லிக்காய், கறிவேப்பிலை, வேம்பு மற்றும் ரோஸ்மேரி — எங்கள் பாட்டிமார் செய்த முறையிலேயே கலக்கப்பட்டது, கவனிப்பு உணரும் முடிக்காக.",
+  "hero_cta1_label_si": "චාරිත්‍රය මිලදී ගන්න",
+  "hero_cta1_label_ta": "சடங்கை வாங்குங்கள்",
+  "hero_cta2_label_si": "සාදන ආකාරය බලන්න",
+  "hero_cta2_label_ta": "இது தயாரிக்கப்படுவதைப் பாருங்கள்",
+  "about_eyebrow_si": "අපේ කතාව",
+  "about_eyebrow_ta": "எங்கள் கதை",
+  "about_headline_si": "ආයුර්වේදයට ම අයත්\nඑම පසෙහිම මුල් හැදුනා.",
+  "about_headline_ta": "ஆயுர்வேதம் வேரூன்றிய\nஅதே மண்ணிலேயே நாங்களும் வேரூன்றினோம்.",
+  "about_paragraph1_si": "Shani''z ආරම්භ වුණේ කුස්සියේ මේසයක සිටයි, කරපිංචා සහ රෝස්මරී අපේ පවුලේ පරම්පරා තුනක් තිස්සේ පිසින ලද ආකාරයටම තම්බමින් — එය ප්‍රවණතාවක් නොව, රැකවරණයේ පුරුද්දක් ලෙසයි. සෑම තොගයක්ම තවමත් අතින් කැළැඹිය හැකි තරම් කුඩාය, එබැවින් ශාක සම්පූර්ණව සහ තෙල් අවංකව පවතී.",
+  "about_paragraph1_ta": "Shani''z ஒரு சமையலறை மேசையில் தொடங்கியது, எங்கள் குடும்பத்தில் மூன்று தலைமுறைகளாகச் செய்யப்பட்ட முறையிலேயே கறிவேப்பிலையையும் ரோஸ்மேரியையும் கொதிக்க வைத்து — இது ஒரு பாணி அல்ல, ஒரு பராமரிப்பு பழக்கம். ஒவ்வொரு தொகுதியும் இன்னும் கையால் கிளற முடிந்தளவு சிறியது, எனவே மூலிகைகள் முழுமையாகவும் எண்ணெய் நேர்மையாகவும் இருக்கும்.",
+  "about_paragraph2_si": "අපි දිගු අමුද්‍රව්‍ය ලැයිස්තු පසුපස නොයමු. අපි ක්‍රියා කරන ඒවා පසුපස යමු: ශක්තිය සඳහා නෙල්ලි, හිසකබල සඳහා කොහොඹ, දිලිසීම සඳහා කරපිංචා, වර්ධනය සඳහා රෝස්මරී. බඳුනේ තවත් කිසිවක් තිබිය යුතු නැත.",
+  "about_paragraph2_ta": "நாங்கள் நீண்ட பொருட்பட்டியல்களைப் பின்தொடர மாட்டோம். வேலை செய்பவற்றைத்தான் பின்தொடர்கிறோம்: வலிமைக்கு நெல்லிக்காய், தலைமண்டைக்கு வேம்பு, பொலிவுக்கு கறிவேப்பிலை, வளர்ச்சிக்கு ரோஸ்மேரி. ஜாடியில் வேறு எதுவும் தேவையில்லை.",
+  "ritual_eyebrow_si": "චාරිත්‍රය",
+  "ritual_eyebrow_ta": "சடங்கு",
+  "ritual_headline_si": "බඳුනේ ඇති දේ මිලදී ගන්න.",
+  "ritual_headline_ta": "ஜாடியில் இருப்பதை வாங்குங்கள்.",
+  "ritual_subtext_si": "ආරම්භ කිරීමට මූලික දේවල් දෙකක් — හිසකබල සඳහා තෙලක් සහ කෙස් සඳහා මාස්ක් එකක්. අඩංගු දේ බැලීමට නිෂ්පාදනය මත මූසිකය තබන්න.",
+  "ritual_subtext_ta": "தொடங்க இரண்டு அடிப்படைப் பொருட்கள் — தலைமண்டைக்கு ஒரு எண்ணெய், முடிக்கு ஒரு மாஸ்க். உள்ளே என்ன இருக்கிறது என்று பார்க்க பொருளின் மேல் சுட்டியை வையுங்கள்."
+}'::jsonb) || value
+WHERE key = 'homepage_content';
+
+-- Payment gateway switch: PayHere replaces the earlier Dialog Genie
+-- placeholder behind the "Credit / Debit Card" checkout option. Widens
+-- (never narrows) the allowed gateway values so this is safe to run
+-- against a database that already has real 'dialog_genie' rows sitting
+-- in payment_methods/orders from before the switch — those keep
+-- meaning exactly what they always meant (a payment actually taken
+-- through the old placeholder path), they just can't be created fresh
+-- anymore now that checkout only ever sends 'koko'/'intpay'/'payhere'.
+DO $$ BEGIN
+  ALTER TABLE payment_methods DROP CONSTRAINT IF EXISTS payment_methods_gateway_check;
+  ALTER TABLE payment_methods ADD CONSTRAINT payment_methods_gateway_check
+    CHECK (gateway IN ('koko', 'intpay', 'dialog_genie', 'payhere'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_gateway_used_check;
+  ALTER TABLE orders ADD CONSTRAINT orders_gateway_used_check
+    CHECK (gateway_used IN ('koko', 'intpay', 'dialog_genie', 'payhere'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
