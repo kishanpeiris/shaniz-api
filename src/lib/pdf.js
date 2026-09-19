@@ -1,4 +1,5 @@
 import PDFDocument from 'pdfkit'
+import { googleMapsLink } from './pickupBranch.js'
 
 // Spec Section 2 / "What's stubbed": "Invoice generation (PDF, auto or
 // on-demand)." The `invoices` table and an invoice EMAIL already
@@ -61,6 +62,24 @@ export function generateInvoicePdf(order) {
       doc.text([addr.line1, addr.city, addr.postal_code].filter(Boolean).join(', '))
     }
     doc.moveDown(1.2)
+
+    // ---- Pickup branch (only present when delivery_method === 'pickup'
+    // — see attachPickupBranch in lib/pickupBranch.js, called by every
+    // route that generates or re-generates this PDF) ----
+    if (order.pickup_branch) {
+      const b = order.pickup_branch
+      doc.fontSize(11).fillColor('#2b3a2f').text('Collect your order from')
+      doc.fontSize(10).fillColor('#5c5949')
+      doc.text(b.name)
+      doc.text(b.address)
+      if (b.phone) doc.text(b.phone)
+      doc.fillColor('#2b3a2f').text('Get directions on Google Maps', {
+        link: googleMapsLink(b),
+        underline: true,
+      })
+      doc.fillColor('#5c5949')
+      doc.moveDown(1.2)
+    }
 
     // ---- Line items table (simple, hand-drawn columns — no external
     // table library needed for a document this small) ----

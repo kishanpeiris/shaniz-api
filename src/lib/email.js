@@ -1,4 +1,5 @@
 import { Resend } from 'resend'
+import { googleMapsLink } from './pickupBranch.js'
 
 // Spec Section 2: "Automated emails: order confirmation, shipping/dispatch
 // notice, invoice (PDF attached)" + Section 2 bookable services: "Booking
@@ -21,6 +22,22 @@ const fmtDate = (d) => {
   if (!d) return ''
   const date = d instanceof Date ? d : new Date(d)
   return date.toISOString().slice(0, 10)
+}
+
+// Shared by the order confirmation and invoice emails — both need to
+// tell a pickup customer which branch and how to get there; nothing to
+// show at all for a home-delivery order (pickup_branch is only ever set
+// when delivery_method === 'pickup', see orders.routes.js).
+function pickupBranchHtml(order) {
+  if (!order.pickup_branch) return ''
+  const b = order.pickup_branch
+  return `
+    <div style="margin:16px 0; padding:12px; border:1px solid #c9a35c; border-radius:4px;">
+      <p style="margin:0 0 4px; font-weight:bold;">Collect your order from:</p>
+      <p style="margin:0;">${b.name}<br/>${b.address}${b.phone ? `<br/>${b.phone}` : ''}</p>
+      <p style="margin:8px 0 0;"><a href="${googleMapsLink(b)}" style="color:#2b3a2f;">Get directions on Google Maps →</a></p>
+    </div>
+  `
 }
 
 async function send({ to, subject, html }) {
@@ -65,6 +82,7 @@ export async function sendOrderConfirmationEmail(order, toEmail) {
     `
       <p>Thank you for your order! Here's a summary:</p>
       <p style="font-size:13px; color:#5c5949;">Order ID: ${order.id}</p>
+      ${pickupBranchHtml(order)}
       <table style="width:100%; border-collapse:collapse; margin: 16px 0;">${rows}
         <tr><td style="padding-top:10px; font-weight:bold;">Total</td>
             <td style="padding-top:10px; font-weight:bold; text-align:right;">${fmt(order.total_lkr)}</td></tr>
@@ -229,6 +247,7 @@ export async function sendInvoiceEmail(order, toEmail, pdfUrl) {
   const html = layout(
     'Your Invoice',
     `<p>Your invoice for order <strong>${order.id.slice(0, 8)}</strong> is ready.</p>
+     ${pickupBranchHtml(order)}
      ${pdfUrl ? `<p><a href="${pdfUrl}" style="color:#2b3a2f;">Download invoice (PDF)</a></p>` : ''}`
   )
   return send({ to: toEmail, subject: `Invoice — ${order.id.slice(0, 8)}`, html })

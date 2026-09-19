@@ -15,6 +15,79 @@ const toMinutes = (t) => {
 const toTimeString = (mins) =>
   `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}:00`
 
+// Works out the open slots for one service on one date. Used both to show
+// the customer the open times AND to double-check a booking request
+// before saving it (so nobody can book a closed day by tampering).
+//
+// How the available times are decided:
+//  1. The service's own weekly windows for that weekday. If the service
+//     has NO windows at all and its branch has opening hours, the branch's
+//     opening hours are used instead ("follow the shop hours").
+//  2. Whatever the source, times are cut to the branch's opening hours
+//     for that weekday, and a day the branch is closed has no slots.
+//  3. Blackout days (days off) and already-booked times are removed.
+async function computeSlots(serviceId, dateStr) {
+  const service = await query(
+    'SELECT id, duration_minutes, service_type, branch_id FROM services WHERE id = $1 AND is_active = TRUE',
+    [serviceId]
+  )
+  if (!service.rows[0]) return { status: 404, error: 'Service not found.' }
+  if (service.rows[0].service_type !== 'bookable') {
+    return { status: 400, error: 'This service does not use time slots.' }
+  }
+  const duration = service.rows[0].duration_minutes
+  const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay()
+
+  const blackout = await query(
+    `SELECT 1 FROM service_blackouts
+     WHERE blackout_date = $1 AND (service_id = $2 OR service_id IS NULL)`,
+    [dateStr, serviceId]
+  )
+  if (blackout.rows.length > 0) return { slots: [] }
+
+  let branchHours = null
+  if (service.rows[0].branch_id) {
+    const b = await query('SELECT opening_hours FROM branches WHERE id = $1', [service.rows[0].branch_id])
+    branchHours = b.rows[0]?.opening_hours ?? null
+  }
+  const dayHours = branchHours ? branchHours[String(dayOfWeek)] : null
+  if (branchHours && !dayHours) return { slots: [] } // branch closed that day
+
+  const own = await query(
+    `SELECT start_time, end_time FROM service_availability
+     WHERE service_id = $1 AND day_of_week = $2`,
+    [serviceId, dayOfWeek]
+  )
+  let windows = own.rows
+  if (windows.length === 0 && dayHours) {
+    const anyOwn = await query('SELECT 1 FROM service_availability WHERE service_id = $1 LIMIT 1', [serviceId])
+    if (anyOwn.rows.length === 0) windows = [{ start_time: dayHours.open, end_time: dayHours.close }]
+  }
+
+  const booked = await query(
+    `SELECT booked_time FROM bookings
+     WHERE service_id = $1 AND booked_date = $2 AND status != 'cancelled'`,
+    [serviceId, dateStr]
+  )
+  const bookedTimes = new Set(booked.rows.map((r) => r.booked_time))
+
+  const slots = []
+  for (const w of windows) {
+    let cursor = toMinutes(w.start_time)
+    let end = toMinutes(w.end_time)
+    if (dayHours) {
+      cursor = Math.max(cursor, toMinutes(dayHours.open))
+      end = Math.min(end, toMinutes(dayHours.close))
+    }
+    while (cursor + duration <= end) {
+      const t = toTimeString(cursor)
+      if (!bookedTimes.has(t)) slots.push(t)
+      cursor += duration
+    }
+  }
+  return { slots }
+}
+
 // Public: open slots for a service on a given date. This is the
 // customer-facing side of "customer sees only open slots (already-booked
 // slots automatically hidden)" from the spec.
@@ -23,86 +96,76 @@ router.get('/services/:serviceId/slots', async (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr ?? '')) {
     return res.status(400).json({ error: 'date query param must be YYYY-MM-DD.' })
   }
-
-  const service = await query(
-    'SELECT id, duration_minutes, service_type FROM services WHERE id = $1 AND is_active = TRUE',
-    [req.params.serviceId]
-  )
-  if (!service.rows[0]) return res.status(404).json({ error: 'Service not found.' })
-  if (service.rows[0].service_type !== 'bookable') {
-    return res.status(400).json({ error: 'This service does not use time slots.' })
-  }
-  const duration = service.rows[0].duration_minutes
-
-  const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay()
-
-  const blackout = await query(
-    `SELECT 1 FROM service_blackouts
-     WHERE blackout_date = $1 AND (service_id = $2 OR service_id IS NULL)`,
-    [dateStr, req.params.serviceId]
-  )
-  if (blackout.rows.length > 0) {
-    return res.json({ date: dateStr, slots: [] })
-  }
-
-  const windows = await query(
-    `SELECT start_time, end_time FROM service_availability
-     WHERE service_id = $1 AND day_of_week = $2`,
-    [req.params.serviceId, dayOfWeek]
-  )
-
-  const booked = await query(
-    `SELECT booked_time FROM bookings
-     WHERE service_id = $1 AND booked_date = $2 AND status != 'cancelled'`,
-    [req.params.serviceId, dateStr]
-  )
-  const bookedTimes = new Set(booked.rows.map((r) => r.booked_time))
-
-  const slots = []
-  for (const w of windows.rows) {
-    let cursor = toMinutes(w.start_time)
-    const end = toMinutes(w.end_time)
-    while (cursor + duration <= end) {
-      const t = toTimeString(cursor)
-      if (!bookedTimes.has(t)) slots.push(t)
-      cursor += duration
-    }
-  }
-
-  res.json({ date: dateStr, slots })
+  const result = await computeSlots(req.params.serviceId, dateStr)
+  if (result.error) return res.status(result.status).json({ error: result.error })
+  res.json({ date: dateStr, slots: result.slots })
 })
 
+// Friendly, plain-language phone check (Sri Lankan numbers, with or
+// without +94): 9-12 digits, spaces/dashes/brackets allowed.
+const PHONE_MESSAGE =
+  'Please enter a valid phone number, for example 0771234567 (mobile) or 0112345678 (home).'
+const phoneField = z.preprocess(
+  (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+  z
+    .string()
+    .trim()
+    .refine((v) => {
+      const digits = v.replace(/\D/g, '')
+      return /^\+?[\d\s\-()]+$/.test(v) && digits.length >= 9 && digits.length <= 12
+    }, PHONE_MESSAGE)
+    .optional()
+)
+
 const bookingSchema = z.object({
-  service_id: z.string().uuid(),
-  booked_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  booked_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
+  service_id: z.string().uuid('Something went wrong with that service — please close this window and try again.'),
+  booked_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Please pick a valid date.'),
+  booked_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/, 'Please pick one of the available times.'),
   // Only required for guest bookings (no session) — see the check below.
   // guest_name is one field (not first/last) since it's just for display
   // and the confirmation email; mononym-friendly by not splitting it.
-  guest_name: z.string().min(1).max(200).optional(),
-  guest_email: z.string().email().optional(),
-  guest_mobile: z.string().min(7).max(20).optional(),
+  guest_name: z.string().trim().min(1, 'Please enter your name.').max(200, 'That name is too long.').optional(),
+  guest_email: z.string().trim().email('Please enter a valid email address, like name@example.com.').optional(),
+  guest_mobile: phoneField,
+  guest_home_phone: phoneField,
 })
 
 router.post('/', async (req, res) => {
   const parsed = bookingSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
-  const { service_id, booked_date, booked_time, guest_name, guest_email, guest_mobile } = parsed.data
+  const { service_id, booked_date, booked_time, guest_name, guest_email, guest_mobile, guest_home_phone } = parsed.data
 
   if (!req.user && (!guest_name || !guest_email)) {
-    return res.status(400).json({ error: 'guest_name and guest_email are required when not signed in.' })
+    return res.status(400).json({ error: 'Please enter your name and email so we can send your booking confirmation.' })
+  }
+  // At least one way to reach the customer: a mobile or a home phone
+  // (a signed-in customer's saved mobile counts).
+  if (!guest_mobile && !guest_home_phone && !req.user?.mobile) {
+    return res.status(400).json({
+      error: 'Please give us at least one phone number — a mobile or a home phone — so we can reach you about your booking.',
+    })
+  }
+
+  // Re-check the time against the real opening hours / windows / days off
+  // (not just what the page showed), so a closed day can't be booked.
+  const check = await computeSlots(service_id, booked_date)
+  if (check.error) return res.status(check.status).json({ error: check.error })
+  const wanted = booked_time.length === 5 ? `${booked_time}:00` : booked_time
+  if (!check.slots.includes(wanted)) {
+    return res.status(409).json({ error: "Sorry, that time isn't available any more — please pick another time." })
   }
 
   try {
     const { rows } = await query(
-      `INSERT INTO bookings (service_id, user_id, guest_name, guest_email, guest_mobile, booked_date, booked_time)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      `INSERT INTO bookings (service_id, user_id, guest_name, guest_email, guest_mobile, guest_home_phone, booked_date, booked_time)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
       [
         service_id,
         req.user?.id ?? null,
         req.user ? null : guest_name,
         req.user ? null : guest_email,
-        req.user ? null : guest_mobile ?? null,
+        guest_mobile ?? null,
+        guest_home_phone ?? null,
         booked_date,
         booked_time,
       ]
@@ -146,7 +209,7 @@ router.get('/mine', async (req, res) => {
 // Admin: calendar view of all upcoming bookings.
 router.get('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const { rows } = await query(
-    `SELECT b.*, s.name AS service_name, u.name AS user_name, u.email AS user_email
+    `SELECT b.*, s.name AS service_name, u.name AS user_name, u.email AS user_email, u.mobile AS user_mobile
      FROM bookings b
      JOIN services s ON s.id = b.service_id
      LEFT JOIN users u ON u.id = b.user_id

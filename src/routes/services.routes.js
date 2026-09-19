@@ -184,11 +184,14 @@ router.get('/:id/availability', requireRole('admin', 'superadmin'), async (req, 
   res.json({ windows: rows })
 })
 
-const availabilitySchema = z.object({
-  day_of_week: z.number().int().min(0).max(6),
-  start_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
-  end_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/),
-})
+const timeString = z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/, 'Please use a time like 09:00.')
+const availabilitySchema = z
+  .object({
+    day_of_week: z.number().int().min(0).max(6),
+    start_time: timeString,
+    end_time: timeString,
+  })
+  .refine((d) => d.end_time > d.start_time, { message: 'The end time must be later than the start time.' })
 
 router.post('/:id/availability', requireRole('admin', 'superadmin'), async (req, res) => {
   const parsed = availabilitySchema.safeParse(req.body)
@@ -202,6 +205,21 @@ router.post('/:id/availability', requireRole('admin', 'superadmin'), async (req,
   )
   await logBoth(req.user.id, 'service.availability_added', req.params.id, parsed.data)
   res.status(201).json({ window: rows[0] })
+})
+
+// Edit an existing weekly window (day and/or times).
+router.put('/:id/availability/:windowId', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = availabilitySchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const { day_of_week, start_time, end_time } = parsed.data
+  const { rows } = await query(
+    `UPDATE service_availability SET day_of_week = $1, start_time = $2, end_time = $3
+     WHERE id = $4 AND service_id = $5 RETURNING *`,
+    [day_of_week, start_time, end_time, req.params.windowId, req.params.id]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'That time window was not found.' })
+  await logBoth(req.user.id, 'service.availability_edited', req.params.id, parsed.data)
+  res.json({ window: rows[0] })
 })
 
 router.delete('/:id/availability/:windowId', requireRole('admin', 'superadmin'), async (req, res) => {

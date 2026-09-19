@@ -3,6 +3,8 @@ import crypto from 'crypto'
 import { query } from '../db/pool.js'
 import { logAudit } from '../lib/log.js'
 import { sendInvoiceEmail } from '../lib/email.js'
+import { attachPickupBranch } from '../lib/pickupBranch.js'
+import { ensureInvoice } from './orders.routes.js'
 
 const router = Router()
 
@@ -96,7 +98,22 @@ router.post('/payhere', async (req, res) => {
       (order.user_id
         ? (await query('SELECT email FROM users WHERE id = $1', [order.user_id])).rows[0]?.email
         : null)
-    if (recipientEmail) await sendInvoiceEmail(order, recipientEmail, null)
+    if (recipientEmail) {
+      const enrichedOrder = await attachPickupBranch(order)
+      // Same "never let a PDF hiccup block the webhook response" logic
+      // as the sandbox-pay/admin-status-change paths in orders.routes.js
+      // — PayHere retries notify_url on failure, and a stuck invoice
+      // generator is not a reason to make it think the payment itself
+      // failed. The invoice can still be generated later, on demand,
+      // via GET /:id/invoice.
+      let pdfUrl = null
+      try {
+        pdfUrl = await ensureInvoice(enrichedOrder)
+      } catch (err) {
+        console.error('Invoice PDF generation failed:', err.message)
+      }
+      await sendInvoiceEmail(enrichedOrder, recipientEmail, pdfUrl)
+    }
   }
 
   // PayHere expects a plain 200 OK — no JSON body required, but an
@@ -148,7 +165,16 @@ router.post('/:gateway', async (req, res) => {
       (order.user_id
         ? (await query('SELECT email FROM users WHERE id = $1', [order.user_id])).rows[0]?.email
         : null)
-    if (recipientEmail) await sendInvoiceEmail(order, recipientEmail, null)
+    if (recipientEmail) {
+      const enrichedOrder = await attachPickupBranch(order)
+      let pdfUrl = null
+      try {
+        pdfUrl = await ensureInvoice(enrichedOrder)
+      } catch (err) {
+        console.error('Invoice PDF generation failed:', err.message)
+      }
+      await sendInvoiceEmail(enrichedOrder, recipientEmail, pdfUrl)
+    }
   }
 
   res.json({ ok: true })

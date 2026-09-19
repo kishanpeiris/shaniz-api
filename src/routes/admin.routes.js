@@ -535,7 +535,7 @@ router.delete('/blacklist/:id', async (req, res) => {
 // ---- Admin management (superadmin only) ----
 router.get('/admins', requireRole('superadmin'), async (req, res) => {
   const { rows } = await query(
-    `SELECT id, name, email, role, is_primary_superadmin, disabled, created_at
+    `SELECT id, name, email, mobile, role, is_primary_superadmin, disabled, created_at
      FROM users WHERE role IN ('admin','superadmin') ORDER BY created_at`
   )
   res.json({ admins: rows })
@@ -591,6 +591,101 @@ router.delete('/admins/:id', requireRole('superadmin'), async (req, res) => {
   }
   await query('DELETE FROM users WHERE id = $1', [req.params.id])
   await logBoth(req.user.id, 'admin.deleted', req.params.id)
+  res.json({ ok: true })
+})
+
+// ---- Edit accounts + change passwords ----
+// Passwords are stored as one-way bcrypt hashes (spec Section 7), so they
+// can never be *shown* to anyone — not even a super admin. What a super
+// admin CAN do is set a NEW password for someone (below). The password
+// is never written to the audit log.
+const accountEditSchema = z.object({
+  first_name: z.string().trim().min(1).max(100).optional(),
+  last_name: z.string().trim().max(100).optional(),
+  name: z.string().trim().min(1).max(200).optional(),
+  email: z.string().trim().toLowerCase().email().optional(),
+  mobile: z.string().trim().max(30).optional(),
+  role: z.enum(['admin', 'superadmin']).optional(), // admins only — see below
+})
+
+const adminSetPasswordSchema = z.object({
+  password: z
+    .string()
+    .min(10, 'Password must be at least 10 characters.')
+    .regex(/[A-Z]/, 'Password needs at least one uppercase letter.')
+    .regex(/[0-9]/, 'Password needs at least one number.'),
+})
+
+// Shared by the customer and admin edit routes. `kind` decides which
+// roles the target is allowed to have, so the customer route can never
+// be used to touch an admin (or vice versa).
+async function editAccount(req, res, kind) {
+  const parsed = accountEditSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const d = parsed.data
+
+  const roles = kind === 'admin' ? ['admin', 'superadmin'] : ['customer']
+  const target = await query('SELECT id, role, is_primary_superadmin FROM users WHERE id = $1 AND role = ANY($2)', [
+    req.params.id,
+    roles,
+  ])
+  if (!target.rows[0]) return res.status(404).json({ error: 'Account not found.' })
+
+  if (d.role && kind === 'admin' && target.rows[0].is_primary_superadmin && d.role !== 'superadmin') {
+    return res.status(403).json({ error: 'The primary super admin must stay a super admin.' })
+  }
+  if (d.email) {
+    const clash = await query('SELECT id FROM users WHERE email = $1 AND id <> $2', [d.email, req.params.id])
+    if (clash.rows.length) return res.status(409).json({ error: 'That email is already used by another account.' })
+  }
+
+  // Keep `name` in step with first/last name when those are edited.
+  let fullName = d.name
+  if (!fullName && (d.first_name !== undefined || d.last_name !== undefined)) {
+    const cur = await query('SELECT first_name, last_name FROM users WHERE id = $1', [req.params.id])
+    const first = d.first_name ?? cur.rows[0].first_name ?? ''
+    const last = d.last_name ?? cur.rows[0].last_name ?? ''
+    fullName = `${first} ${last}`.trim() || undefined
+  }
+
+  const { rows } = await query(
+    `UPDATE users SET
+       name       = COALESCE($1, name),
+       first_name = COALESCE($2, first_name),
+       last_name  = COALESCE($3, last_name),
+       email      = COALESCE($4, email),
+       mobile     = COALESCE($5, mobile),
+       role       = COALESCE($6, role)
+     WHERE id = $7
+     RETURNING id, name, first_name, last_name, email, mobile, role, disabled, is_primary_superadmin`,
+    [fullName ?? null, d.first_name ?? null, d.last_name ?? null, d.email ?? null, d.mobile ?? null, kind === 'admin' ? d.role ?? null : null, req.params.id]
+  )
+  await logBoth(req.user.id, kind === 'admin' ? 'admin.edited' : 'customer.edited', req.params.id, {
+    fields: Object.keys(d),
+  })
+  res.json({ account: rows[0] })
+}
+
+router.put('/customers/:id', requireRole('admin', 'superadmin'), (req, res) => editAccount(req, res, 'customer'))
+router.put('/admins/:id', requireRole('superadmin'), (req, res) => editAccount(req, res, 'admin'))
+
+// Super admin only: set a new password for any account (customer, admin
+// or super admin). Nobody except the primary super admin themselves can
+// change the primary super admin's password — otherwise any other super
+// admin could quietly take over the top account.
+router.put('/users/:id/password', requireRole('superadmin'), async (req, res) => {
+  const parsed = adminSetPasswordSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  const target = await query('SELECT id, role, is_primary_superadmin FROM users WHERE id = $1', [req.params.id])
+  if (!target.rows[0]) return res.status(404).json({ error: 'Account not found.' })
+  if (target.rows[0].is_primary_superadmin && target.rows[0].id !== req.user.id) {
+    return res.status(403).json({ error: "Only the primary super admin can change their own password (Settings → your account)." })
+  }
+
+  const passwordHash = await bcrypt.hash(parsed.data.password, 12)
+  await query('UPDATE users SET password_hash = $1 WHERE id = $2', [passwordHash, req.params.id])
+  await logBoth(req.user.id, 'user.password_set_by_admin', req.params.id, { role: target.rows[0].role })
   res.json({ ok: true })
 })
 
@@ -748,6 +843,18 @@ const homepageContentSchema = z.object({
   ritual_subtext_ta: z.string().max(500).optional(),
   ritual_background_url: z.union([z.string().url(), z.literal('')]).optional(),
   ritual_video_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  // "See It Made" section text — previously hardcoded directly in
+  // RitualVideo.jsx (which is also why it never translated into
+  // Sinhala/Tamil before this was added).
+  ritual_video_eyebrow: z.string().max(120).optional(),
+  ritual_video_eyebrow_si: z.string().max(120).optional(),
+  ritual_video_eyebrow_ta: z.string().max(120).optional(),
+  ritual_video_headline: z.string().max(300).optional(),
+  ritual_video_headline_si: z.string().max(300).optional(),
+  ritual_video_headline_ta: z.string().max(300).optional(),
+  ritual_video_subtext: z.string().max(500).optional(),
+  ritual_video_subtext_si: z.string().max(500).optional(),
+  ritual_video_subtext_ta: z.string().max(500).optional(),
   // Up to 9 process-video URLs (shown 3 at a time on the homepage, with
   // paging arrows past that — see RowCarousel.jsx). Capped server-side
   // too, not just in the admin UI, since this is a public-facing

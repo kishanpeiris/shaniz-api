@@ -250,8 +250,21 @@ CREATE TABLE IF NOT EXISTS branches (
   latitude   DOUBLE PRECISION,
   longitude  DOUBLE PRECISION,
   phone      TEXT,
+  -- The branch pre-selected by default in checkout's pickup picker.
+  -- Enforced as "at most one TRUE row" by a partial unique index
+  -- (added further down, alongside the other post-hoc ALTERs, since it
+  -- also needs to apply to databases that already have this table)
+  -- rather than in application code, so it can never drift out of sync
+  -- no matter which code path updates it.
+  is_main    BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Opening hours per branch: {"0": {"open": "10:00", "close": "16:00"}, "1": {...}}
+-- where the key is the day of week (0 = Sunday). A day that is missing means
+-- CLOSED that day. NULL (never set) means "no restriction" — bookings then
+-- follow each service's own weekly windows only, exactly as before.
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS opening_hours JSONB;
 
 CREATE TABLE IF NOT EXISTS services (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -357,7 +370,20 @@ CREATE TABLE IF NOT EXISTS orders (
   customer_phone      TEXT,
   customer_email      TEXT, -- always populated: account email or guest email
   delivery_method TEXT CHECK (delivery_method IN ('pickup', 'delivery')),
-  delivery_region TEXT CHECK (delivery_region IN ('colombo_main', 'colombo_suburbs', 'outer_suburbs', 'outside_colombo')),
+  -- No inline CHECK here (unlike delivery_method above) — delivery
+  -- zones are admin-editable (Admin → Delivery, added in an earlier
+  -- pass), so a hardcoded list of allowed values would silently reject
+  -- any zone an admin adds later. isValidRegion() in lib/delivery.js,
+  -- checked at order-creation time in orders.routes.js, is what
+  -- actually guards this column now.
+  delivery_region TEXT,
+  -- Which branch a pickup order will be collected from — only ever set
+  -- when delivery_method = 'pickup'. ON DELETE SET NULL rather than
+  -- blocking branch deletion: an order's own emailed/PDF'd branch
+  -- details already captured everything that mattered at the time, so
+  -- losing the live link later is a minor cosmetic loss, not a data
+  -- integrity problem worth blocking an admin's branch cleanup over.
+  pickup_branch_id UUID REFERENCES branches(id) ON DELETE SET NULL,
   delivery_fee_lkr NUMERIC(12,2) NOT NULL DEFAULT 0,
   shipping_address JSONB, -- snapshot: {first_name,last_name,line1,city,postal_code,phone,region}
   billing_address  JSONB, -- same shape; null/omitted when billing = shipping
@@ -373,6 +399,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_phone TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS customer_email TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_method TEXT;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_region TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS pickup_branch_id UUID REFERENCES branches(id) ON DELETE SET NULL;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS delivery_fee_lkr NUMERIC(12,2) NOT NULL DEFAULT 0;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_address JSONB;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS billing_address JSONB;
@@ -384,10 +411,21 @@ DO $$ BEGIN
   ALTER TABLE orders ADD CONSTRAINT orders_delivery_method_check CHECK (delivery_method IN ('pickup', 'delivery'));
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
-DO $$ BEGIN
-  ALTER TABLE orders ADD CONSTRAINT orders_delivery_region_check CHECK (delivery_region IN ('colombo_main', 'colombo_suburbs', 'outer_suburbs', 'outside_colombo'));
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
+-- Widening, not narrowing: a database from before delivery zones became
+-- admin-editable may still have the old hardcoded 4-value CHECK sitting
+-- on this column from when it was first created (that ADD CONSTRAINT
+-- always used to silently no-op here via duplicate_object once already
+-- present, so it could never widen itself no matter how many times
+-- schema.sql re-ran) — drop it unconditionally so isValidRegion()
+-- becomes the one and only source of truth for what's allowed, matching
+-- a database created fresh today (no CHECK on this column at all).
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_delivery_region_check;
+
+-- Same one-main-only rule as the fresh-install CREATE TABLE above,
+-- applied to databases that already had a branches table before this
+-- pass added is_main.
+ALTER TABLE branches ADD COLUMN IF NOT EXISTS is_main BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE UNIQUE INDEX IF NOT EXISTS branches_one_main_only ON branches (is_main) WHERE is_main = TRUE;
 
 -- Logged-in customers' baskets persist across devices/sessions ("logging
 -- in will save their basket"). One row per user; the whole basket is
@@ -421,6 +459,9 @@ CREATE TABLE IF NOT EXISTS bookings (
 -- doesn't need one).
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_name TEXT;
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_mobile TEXT;
+-- Contact numbers: a booking needs at least one of mobile / home phone.
+-- Stored for signed-in customers too (their profile may have no number).
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS guest_home_phone TEXT;
 -- Booking reminder emails (day-before): set TRUE once a reminder has gone
 -- out for this booking, so the daily job never double-sends one even if
 -- it runs more than once or the booking spans a job restart.
@@ -714,3 +755,24 @@ DO $$ BEGIN
     CHECK (gateway_used IN ('koko', 'intpay', 'dialog_genie', 'payhere'));
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+
+-- "See It Made" section text (RitualVideo.jsx) was hardcoded in English
+-- directly in that component until now — it had no homepage_content
+-- fields at all before this pass, English or otherwise, so this both
+-- adds the base English text AND its Sinhala/Tamil translations in one
+-- go. Same safe merge pattern as the block above: existing keys in
+-- `value` always win, so this never overwrites anything an admin has
+-- since customized via Settings → Page Content → See It Made.
+UPDATE site_settings
+SET value = ('{
+  "ritual_video_eyebrow": "See it made",
+  "ritual_video_eyebrow_si": "සාදන ආකාරය",
+  "ritual_video_eyebrow_ta": "தயாரிப்பு முறை",
+  "ritual_video_headline": "The ritual, start to finish.",
+  "ritual_video_headline_si": "චාරිත්‍රය, ආරම්භයේ සිට අවසානය දක්වා.",
+  "ritual_video_headline_ta": "சடங்கு, தொடக்கம் முதல் முடிவு வரை.",
+  "ritual_video_subtext": "A short look at how each batch is blended — from fresh leaf to finished bottle.",
+  "ritual_video_subtext_si": "සෑම තොගයක්ම මිශ්‍ර කරන ආකාරය පිළිබඳ කෙටි දසුනක් — නැවුම් කොළයේ සිට නිමි බෝතලය දක්වා.",
+  "ritual_video_subtext_ta": "ஒவ்வொரு தொகுதியும் எவ்வாறு கலக்கப்படுகிறது என்பதற்கான சுருக்கமான காட்சி — புதிய இலையிலிருந்து முடிக்கப்பட்ட பாட்டில் வரை."
+}'::jsonb) || value
+WHERE key = 'homepage_content';

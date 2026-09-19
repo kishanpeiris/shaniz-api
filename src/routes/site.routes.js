@@ -20,11 +20,12 @@ router.get('/address-autocomplete', addressAutocompleteLimiter, async (req, res)
   if (!parsed.success) return res.json({ suggestions: [] })
 
   try {
+    // Already just { line1 } strings, deduplicated — see geocode.js's
+    // buildStreetLine for why this isn't the raw display_name (which
+    // would repeat the City/Postal Code fields sitting right next to
+    // this one on the form).
     const results = await autocompleteAddress(parsed.data)
-    const suggestions = (results || [])
-      .map((r) => r.display_name)
-      .filter(Boolean)
-      .slice(0, 6)
+    const suggestions = results.map((r) => r.line1).slice(0, 6)
     res.json({ suggestions })
   } catch (err) {
     console.error('[address-autocomplete] failed:', err.message)

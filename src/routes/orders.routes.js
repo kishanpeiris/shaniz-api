@@ -4,6 +4,7 @@ import { query, pool } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth, logAudit } from '../lib/log.js'
 import { sendOrderConfirmationEmail, sendShippingNoticeEmail, sendInvoiceEmail, sendFraudAlertEmail, sendRefundRequestReceivedEmail, sendRefundRequestResolvedEmail } from '../lib/email.js'
+import { attachPickupBranch } from '../lib/pickupBranch.js'
 import { sendOrderConfirmationSms } from '../lib/sms.js'
 import { createCheckoutSession, isConfigured, refundPayment, GATEWAYS } from '../lib/gateways.js'
 import { deliveryFee, isValidRegion } from '../lib/delivery.js'
@@ -20,7 +21,7 @@ import { storePdf } from '../lib/uploads.js'
 // (so re-visiting the thank-you page or clicking "Download Invoice"
 // twice doesn't render + upload a fresh PDF every time), otherwise
 // generates one, stores it, and records it in the `invoices` table.
-async function ensureInvoice(order) {
+export async function ensureInvoice(order) {
   const existing = await query('SELECT pdf_url FROM invoices WHERE order_id = $1', [order.id])
   // Re-generate rather than reuse if the stored URL doesn't actually end
   // in .pdf — a handful of invoices generated before the Cloudinary
@@ -75,6 +76,7 @@ const orderSchema = z
     // Delivery
     delivery_method: z.enum(['pickup', 'delivery']),
     delivery_region: z.string().optional(), // required when delivery_method === 'delivery'
+    pickup_branch_id: z.string().uuid().optional(), // required when delivery_method === 'pickup'
     shipping_address_id: z.string().uuid().optional(), // pick a saved address (logged-in only)
     shipping_address: addressInputSchema.optional(), // or enter a new one
 
@@ -97,6 +99,10 @@ const orderSchema = z
   .refine((d) => d.delivery_method !== 'delivery' || isValidRegion(d.delivery_region), {
     message: 'A valid delivery region is required for home delivery.',
     path: ['delivery_region'],
+  })
+  .refine((d) => d.delivery_method !== 'pickup' || Boolean(d.pickup_branch_id), {
+    message: 'Pick a branch to collect your order from.',
+    path: ['pickup_branch_id'],
   })
 
 async function resolveAddress({ client, userId, addressId, inline, region }) {
@@ -243,6 +249,16 @@ router.post('/', async (req, res) => {
           region: null,
         })
 
+    // Validate the branch exists (a stale/removed branch id shouldn't
+    // silently create an order nobody can find in the pickup schedule) —
+    // this is the pickup-method equivalent of resolveAddress() above.
+    let pickupBranch = null
+    if (d.delivery_method === 'pickup') {
+      const { rows } = await client.query('SELECT * FROM branches WHERE id = $1', [d.pickup_branch_id])
+      if (!rows[0]) throw new HttpError(400, 'Selected branch not found — please choose a branch again.')
+      pickupBranch = rows[0]
+    }
+
     const fee = deliveryFee(d.delivery_method, d.delivery_region)
     const total = subtotal + fee
     const customerEmail = req.user?.email ?? d.guest_email
@@ -251,9 +267,9 @@ router.post('/', async (req, res) => {
       `INSERT INTO orders (
          user_id, guest_email, items, total_lkr, gateway_used,
          customer_first_name, customer_last_name, customer_phone, customer_email,
-         delivery_method, delivery_region, delivery_fee_lkr,
+         delivery_method, delivery_region, pickup_branch_id, delivery_fee_lkr,
          shipping_address, billing_address, save_card_requested, customer_ip
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
       [
         userId,
         userId ? null : d.guest_email,
@@ -266,6 +282,7 @@ router.post('/', async (req, res) => {
         customerEmail,
         d.delivery_method,
         d.delivery_method === 'delivery' ? d.delivery_region : null,
+        d.delivery_method === 'pickup' ? d.pickup_branch_id : null,
         fee,
         shippingSnapshot ? JSON.stringify(shippingSnapshot) : null,
         billingSnapshot ? JSON.stringify(billingSnapshot) : null,
@@ -274,7 +291,7 @@ router.post('/', async (req, res) => {
       ]
     )
 
-    const order = orderRows[0]
+    const order = { ...orderRows[0], pickup_branch: pickupBranch }
 
     // Fraud check runs inside this same transaction so the "past orders"
     // counts it looks at are consistent with the order just inserted
@@ -506,7 +523,7 @@ router.post('/:id/return-request', (req, res) =>
 
 router.get('/:id', async (req, res) => {
   const { rows } = await query('SELECT * FROM orders WHERE id = $1', [req.params.id])
-  const order = rows[0]
+  let order = rows[0]
   if (!order) return res.status(404).json({ error: 'Order not found.' })
 
   const isOwner = req.user && order.user_id === req.user.id
@@ -517,6 +534,8 @@ router.get('/:id', async (req, res) => {
   if (!isOwner && !isAdmin && !isGuestMatch) {
     return res.status(404).json({ error: 'Order not found.' })
   }
+
+  order = await attachPickupBranch(order)
 
   // The most recent request (of either type) for this order, if any —
   // lets the customer's order page show "cancellation pending review" /
@@ -564,7 +583,7 @@ router.get('/:id/invoice', async (req, res) => {
     return res.status(400).json({ error: 'An invoice is only available once the order is paid.' })
   }
 
-  const pdfUrl = await ensureInvoice(order)
+  const pdfUrl = await ensureInvoice(await attachPickupBranch(order))
   res.redirect(pdfUrl)
 })
 
@@ -645,6 +664,7 @@ router.post('/:id/sandbox-pay', async (req, res) => {
     // the payment response — the order is already marked paid above.
     // The invoice can still be generated later, on demand, via
     // GET /:id/invoice.
+    updated[0] = await attachPickupBranch(updated[0])
     let pdfUrl = null
     try {
       pdfUrl = await ensureInvoice(updated[0])
@@ -659,7 +679,7 @@ router.post('/:id/sandbox-pay', async (req, res) => {
 
 // Admin dashboard: list + filter by status/gateway.
 router.get('/', requireRole('admin', 'superadmin'), async (req, res) => {
-  const { status, gateway } = req.query
+  const { status, gateway, pickup_branch } = req.query
   const clauses = []
   const values = []
   if (status) {
@@ -669,6 +689,17 @@ router.get('/', requireRole('admin', 'superadmin'), async (req, res) => {
   if (gateway) {
     values.push(gateway)
     clauses.push(`gateway_used = $${values.length}`)
+  }
+  // Filter by pickup branch: a branch id shows only orders collected at
+  // that branch; the special value 'delivery' shows delivery orders only.
+  if (pickup_branch === 'delivery') {
+    clauses.push(`delivery_method = 'delivery'`)
+  } else if (pickup_branch) {
+    if (!z.string().uuid().safeParse(pickup_branch).success) {
+      return res.status(400).json({ error: 'Invalid branch.' })
+    }
+    values.push(pickup_branch)
+    clauses.push(`pickup_branch_id = $${values.length}`)
   }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
   const { rows } = await query(`SELECT * FROM orders ${where} ORDER BY created_at DESC LIMIT 200`, values)
@@ -686,13 +717,14 @@ router.put('/:id/status', requireRole('admin', 'superadmin'), async (req, res) =
     [parsed.data.status, req.params.id]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Order not found.' })
-  const order = rows[0]
+  let order = rows[0]
   await logBoth(req.user.id, 'order.status_changed', order.id, { status: parsed.data.status })
 
   const recipientEmail = order.customer_email ?? (await resolveOrderEmail(order))
   if (recipientEmail) {
     if (order.status === 'shipped') await sendShippingNoticeEmail(order, recipientEmail)
     if (order.status === 'paid') {
+      order = await attachPickupBranch(order)
       let pdfUrl = null
       try {
         pdfUrl = await ensureInvoice(order)
