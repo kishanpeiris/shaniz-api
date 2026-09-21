@@ -4,7 +4,9 @@ import { query } from '../db/pool.js'
 import { regionsForApi } from '../lib/delivery.js'
 import { sendContactMessageEmail } from '../lib/email.js'
 import { translateToEnglish } from '../lib/ai.js'
-import { logActivity } from '../lib/log.js'
+import { logActivity, logBoth } from '../lib/log.js'
+import { requireRole } from '../middleware/auth.js'
+import { getServiceProvider, clearServiceProviderCache } from '../lib/serviceProvider.js'
 import { contactLimiter, addressAutocompleteLimiter } from '../middleware/rateLimit.js'
 import { autocompleteAddress } from '../lib/geocode.js'
 
@@ -89,6 +91,41 @@ router.get('/delivery-options', (req, res) => {
 router.get('/homepage-content', async (req, res) => {
   const { rows } = await query(`SELECT value FROM site_settings WHERE key = 'homepage_content'`)
   res.json({ homepage_content: rows[0]?.value ?? {} })
+})
+
+// Public: the subsidiary that provides every service (name, logo, and the
+// "Provided by ..." wording in each language). Shown on service thumbnails,
+// service pages, the booking pop-up, basket and checkout.
+router.get('/service-provider', async (req, res) => {
+  res.json({ service_provider: await getServiceProvider() })
+})
+
+const providerSchema = z.object({
+  name: z.string().trim().min(1, 'Please enter the company name.').max(120),
+  // Empty = no logo (the name is shown as text instead). Only http(s) links.
+  logo_url: z
+    .string()
+    .trim()
+    .max(500)
+    .refine((v) => v === '' || /^https?:\/\//i.test(v), 'The logo must be an uploaded image.'),
+  wording_en: z.string().trim().min(1, 'Please enter the English wording.').max(160),
+  wording_si: z.string().trim().max(160).optional().default(''),
+  wording_ta: z.string().trim().max(160).optional().default(''),
+})
+
+// Admin-only. Plain text only (React and the email templates escape it).
+router.put('/service-provider', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = providerSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+
+  await query(
+    `INSERT INTO site_settings (key, value) VALUES ('service_provider', $1::jsonb)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+    [JSON.stringify(parsed.data)]
+  )
+  clearServiceProviderCache()
+  await logBoth(req.user.id, 'service_provider.updated', 'service_provider', { name: parsed.data.name })
+  res.json({ service_provider: await getServiceProvider() })
 })
 
 const contactSchema = z.object({

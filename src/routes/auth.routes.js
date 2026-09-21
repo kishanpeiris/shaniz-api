@@ -197,7 +197,12 @@ router.post('/forgot-password', passwordResetLimiter, async (req, res) => {
     )
 
     const resetUrl = `${process.env.FRONTEND_ORIGIN}/reset-password?token=${rawToken}`
-    await sendPasswordResetEmail(email.data, resetUrl)
+    const sent = await sendPasswordResetEmail(email.data, resetUrl)
+    console.log(
+      sent?.error
+        ? `[auth] password reset for ${email.data}: email FAILED — ${sent.error}`
+        : `[auth] password reset for ${email.data}: email sent`
+    )
 
     // Never log the raw token in production — the email above is the only
     // place it should ever appear.
@@ -205,6 +210,8 @@ router.post('/forgot-password', passwordResetLimiter, async (req, res) => {
       console.log(`[dev only] password reset token for ${email.data}: ${rawToken}`)
     }
   }
+
+  if (rows.length === 0) console.log(`[auth] password reset requested for ${email.data}: no account with that email (nothing sent)`)
 
   // Always return the same response whether or not the email existed.
   res.json({ ok: true, message: 'If that email exists, a reset link has been sent.' })

@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import crypto from 'crypto'
 import bcrypt from 'bcrypt'
 import { z } from 'zod'
 import { query, pool } from '../db/pool.js'
@@ -12,6 +13,8 @@ import { refundPayment } from '../lib/gateways.js'
 import { issueVerificationEmail } from './auth.routes.js'
 import { adminResendVerificationLimiter } from '../middleware/rateLimit.js'
 import { loadRegions } from '../lib/delivery.js'
+import { sendTestEmail, sendPasswordResetEmail } from '../lib/email.js'
+import { cleanRichText } from '../lib/sanitize.js'
 
 const router = Router()
 
@@ -689,6 +692,37 @@ router.put('/users/:id/password', requireRole('superadmin'), async (req, res) =>
   res.json({ ok: true })
 })
 
+// Emails the person a password-reset link (the same one "Forgot password"
+// sends). Safer than an admin ever handling someone's password. Admins can
+// do this for customers; only a super admin can do it for staff accounts.
+router.post('/users/:id/send-reset', async (req, res) => {
+  const { rows } = await query('SELECT id, email, role FROM users WHERE id = $1', [req.params.id])
+  const target = rows[0]
+  if (!target) return res.status(404).json({ error: 'Account not found.' })
+  if (target.role !== 'customer' && req.user.role !== 'superadmin') {
+    return res.status(403).json({ error: 'Only a super admin can send a reset link to a staff account.' })
+  }
+  const rawToken = crypto.randomBytes(32).toString('hex')
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex')
+  await query(`INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`, [
+    target.id,
+    tokenHash,
+    new Date(Date.now() + 20 * 60 * 1000),
+  ])
+  const sent = await sendPasswordResetEmail(target.email, `${process.env.FRONTEND_ORIGIN}/reset-password?token=${rawToken}`)
+  await logBoth(req.user.id, 'user.reset_link_sent', target.id, { role: target.role })
+  if (sent?.error) return res.status(502).json({ error: `The email could not be sent: ${sent.error}`, hint: sent.hint })
+  res.json({ ok: true })
+})
+
+// ---- Email check: sends a test message and reports the REAL result ----
+router.post('/email-test', requireRole('superadmin'), async (req, res) => {
+  const parsed = z.object({ to: z.string().email().optional() }).safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Please enter a valid email address.' })
+  const result = await sendTestEmail(parsed.data.to || req.user.email)
+  res.json(result)
+})
+
 // ---- Business info (Settings page) ----
 // Deliberately limited to non-secret, low-risk fields. API keys, DB
 // credentials, and payment gateway secrets are NOT managed here — they
@@ -796,6 +830,21 @@ router.put('/settings/order-policies', async (req, res) => {
 // ---- Homepage content (basic CMS — Section 2's "Page customization UI") ----
 // Same "safe, low-risk fields only" reasoning as business info above:
 // this is marketing copy, not anything security-sensitive.
+// An uploaded file's address is either a full https:// link (Cloudinary) or,
+// on a simple setup, a /uploads/... path — both are fine. Blank = "use the default".
+const urlOrBlank = z
+  .string()
+  .max(1000)
+  .refine((v) => v === '' || /^https?:\/\//.test(v) || v.startsWith('/'), 'The uploaded file address looks wrong — please upload it again.')
+
+// Turns a validation problem into a sentence that names the field, e.g.
+// "About paragraph1: Text is too long (max 1000 characters)".
+export const friendlyIssue = (issue) => {
+  const field = String(issue.path?.[0] ?? '').replace(/_/g, ' ')
+  const msg = issue.code === 'too_big' ? `is too long (maximum ${issue.maximum} characters)` : issue.message
+  return field ? `"${field}" ${msg}` : msg
+}
+
 const homepageContentSchema = z.object({
   hero_eyebrow: z.string().max(120).optional(),
   hero_eyebrow_si: z.string().max(120).optional(),
@@ -803,9 +852,9 @@ const homepageContentSchema = z.object({
   hero_headline: z.string().max(300).optional(),
   hero_headline_si: z.string().max(300).optional(),
   hero_headline_ta: z.string().max(300).optional(),
-  hero_subtext: z.string().max(500).optional(),
-  hero_subtext_si: z.string().max(500).optional(),
-  hero_subtext_ta: z.string().max(500).optional(),
+  hero_subtext: z.string().max(4000).transform(cleanRichText).optional(),
+  hero_subtext_si: z.string().max(4000).transform(cleanRichText).optional(),
+  hero_subtext_ta: z.string().max(4000).transform(cleanRichText).optional(),
   hero_cta1_label: z.string().max(60).optional(),
   hero_cta1_label_si: z.string().max(60).optional(),
   hero_cta1_label_ta: z.string().max(60).optional(),
@@ -816,33 +865,33 @@ const homepageContentSchema = z.object({
   // go back to the bundled default image/video" — see the frontend's
   // fallback logic in Hero.jsx/About.jsx/Products.jsx), so these accept
   // '' as well as a real uploaded URL, unlike a plain z.string().url().
-  hero_background_url: z.union([z.string().url(), z.literal('')]).optional(),
-  hero_video_url: z.union([z.string().url(), z.literal('')]).optional(),
+  hero_background_url: urlOrBlank.optional(),
+  hero_video_url: urlOrBlank.optional(),
   about_eyebrow: z.string().max(120).optional(),
   about_eyebrow_si: z.string().max(120).optional(),
   about_eyebrow_ta: z.string().max(120).optional(),
   about_headline: z.string().max(300).optional(),
   about_headline_si: z.string().max(300).optional(),
   about_headline_ta: z.string().max(300).optional(),
-  about_paragraph1: z.string().max(1000).optional(),
-  about_paragraph1_si: z.string().max(1000).optional(),
-  about_paragraph1_ta: z.string().max(1000).optional(),
-  about_paragraph2: z.string().max(1000).optional(),
-  about_paragraph2_si: z.string().max(1000).optional(),
-  about_paragraph2_ta: z.string().max(1000).optional(),
-  about_image_url: z.union([z.string().url(), z.literal('')]).optional(),
-  about_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  about_paragraph1: z.string().max(8000).transform(cleanRichText).optional(),
+  about_paragraph1_si: z.string().max(8000).transform(cleanRichText).optional(),
+  about_paragraph1_ta: z.string().max(8000).transform(cleanRichText).optional(),
+  about_paragraph2: z.string().max(8000).transform(cleanRichText).optional(),
+  about_paragraph2_si: z.string().max(8000).transform(cleanRichText).optional(),
+  about_paragraph2_ta: z.string().max(8000).transform(cleanRichText).optional(),
+  about_image_url: urlOrBlank.optional(),
+  about_background_url: urlOrBlank.optional(),
   ritual_eyebrow: z.string().max(120).optional(),
   ritual_eyebrow_si: z.string().max(120).optional(),
   ritual_eyebrow_ta: z.string().max(120).optional(),
   ritual_headline: z.string().max(300).optional(),
   ritual_headline_si: z.string().max(300).optional(),
   ritual_headline_ta: z.string().max(300).optional(),
-  ritual_subtext: z.string().max(500).optional(),
-  ritual_subtext_si: z.string().max(500).optional(),
-  ritual_subtext_ta: z.string().max(500).optional(),
-  ritual_background_url: z.union([z.string().url(), z.literal('')]).optional(),
-  ritual_video_background_url: z.union([z.string().url(), z.literal('')]).optional(),
+  ritual_subtext: z.string().max(4000).transform(cleanRichText).optional(),
+  ritual_subtext_si: z.string().max(4000).transform(cleanRichText).optional(),
+  ritual_subtext_ta: z.string().max(4000).transform(cleanRichText).optional(),
+  ritual_background_url: urlOrBlank.optional(),
+  ritual_video_background_url: urlOrBlank.optional(),
   // "See It Made" section text — previously hardcoded directly in
   // RitualVideo.jsx (which is also why it never translated into
   // Sinhala/Tamil before this was added).
@@ -852,15 +901,15 @@ const homepageContentSchema = z.object({
   ritual_video_headline: z.string().max(300).optional(),
   ritual_video_headline_si: z.string().max(300).optional(),
   ritual_video_headline_ta: z.string().max(300).optional(),
-  ritual_video_subtext: z.string().max(500).optional(),
-  ritual_video_subtext_si: z.string().max(500).optional(),
-  ritual_video_subtext_ta: z.string().max(500).optional(),
+  ritual_video_subtext: z.string().max(4000).transform(cleanRichText).optional(),
+  ritual_video_subtext_si: z.string().max(4000).transform(cleanRichText).optional(),
+  ritual_video_subtext_ta: z.string().max(4000).transform(cleanRichText).optional(),
   // Up to 9 process-video URLs (shown 3 at a time on the homepage, with
   // paging arrows past that — see RowCarousel.jsx). Capped server-side
   // too, not just in the admin UI, since this is a public-facing
   // section and an unbounded array here would be an easy way to bloat
   // site_settings.
-  see_it_made_videos: z.array(z.string().url()).max(9).optional(),
+  see_it_made_videos: z.array(urlOrBlank).max(9).optional(),
 })
 
 router.get('/settings/homepage-content', async (req, res) => {
@@ -870,7 +919,7 @@ router.get('/settings/homepage-content', async (req, res) => {
 
 router.put('/settings/homepage-content', async (req, res) => {
   const parsed = homepageContentSchema.safeParse(req.body)
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  if (!parsed.success) return res.status(400).json({ error: friendlyIssue(parsed.error.issues[0]) })
 
   const current = await query(`SELECT value FROM site_settings WHERE key = 'homepage_content'`)
   const merged = { ...(current.rows[0]?.value ?? {}), ...parsed.data }
@@ -885,12 +934,12 @@ router.put('/settings/homepage-content', async (req, res) => {
 })
 
 // ---- Maintenance mode & outage calendar (Section 10) ----
-router.get('/outages', async (req, res) => {
+router.get('/outages', requireRole('superadmin'), async (req, res) => {
   const { rows } = await query('SELECT * FROM outage_windows ORDER BY starts_at DESC')
   res.json({ outages: rows })
 })
 
-router.post('/outages', async (req, res) => {
+router.post('/outages', requireRole('superadmin'), async (req, res) => {
   const parsed = z
     .object({
       starts_at: z.string().datetime(),
@@ -916,7 +965,7 @@ router.post('/outages', async (req, res) => {
 // placeholder (see the frontend's MaintenanceGate), an admin can log in
 // and hit Turn Off at any time, even while the placeholder is showing to
 // everyone else.
-router.put('/maintenance-mode', async (req, res) => {
+router.put('/maintenance-mode', requireRole('superadmin'), async (req, res) => {
   const parsed = z
     .discriminatedUnion('enabled', [
       z.object({

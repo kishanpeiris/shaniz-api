@@ -3,6 +3,8 @@ import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
+import { cleanRichText } from '../lib/sanitize.js'
+import { withSalePrice, discountProblem } from '../lib/pricing.js'
 
 const router = Router()
 
@@ -19,12 +21,33 @@ const UNITS_SOLD_SUBQUERY = `
   ) sold ON sold.service_id = s.id
 `
 
+
+// Which branches offer each service (from the service_branches table).
+// Returns Map(serviceId -> [{ id, name, address, latitude, longitude, phone }]).
+async function branchesByService(serviceIds) {
+  const { rows } = await query(
+    `SELECT sb.service_id, b.id, b.name, b.address, b.latitude, b.longitude, b.phone
+     FROM service_branches sb JOIN branches b ON b.id = sb.branch_id
+     ${serviceIds ? 'WHERE sb.service_id = ANY($1::uuid[])' : ''}
+     ORDER BY b.name`,
+    serviceIds ? [serviceIds] : []
+  )
+  const map = new Map()
+  for (const r of rows) {
+    const { service_id, ...branch } = r
+    if (!map.has(service_id)) map.set(service_id, [])
+    map.get(service_id).push(branch)
+  }
+  return map
+}
+
 router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const includeInactive = isAdmin && req.query.all === 'true'
   const { rows } = await query(
     `SELECT s.id, s.name, s.description, s.name_si, s.name_ta, s.description_si, s.description_ta,
             s.price_lkr, s.service_type, s.duration_minutes, s.images,
+            s.discount_type, s.discount_value, s.discount_starts_at, s.discount_ends_at,
             s.hover_video_url, s.hover_webp_url, s.hover_gif_url, s.detail_video_url, s.is_active, s.branch_id,
             s.category_id, c.name AS category, c.parent_id AS category_parent_id, s.badges,
             s.image_focal_x, s.image_focal_y,
@@ -38,7 +61,8 @@ router.get('/', async (req, res) => {
      ${includeInactive ? '' : 'WHERE s.is_active = TRUE'}
      ORDER BY s.created_at DESC`
   )
-  res.json({ services: rows })
+  const branchMap = await branchesByService()
+  res.json({ services: rows.map((r) => withSalePrice({ ...r, branches: branchMap.get(r.id) ?? [] })) })
 })
 
 // Public detail view — same shape as GET /api/products/:id, used by the
@@ -55,19 +79,24 @@ router.get('/:id', async (req, res) => {
     [req.params.id]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Service not found.' })
-  res.json({ service: rows[0] })
+  const branchMap = await branchesByService([rows[0].id])
+  res.json({ service: withSalePrice({ ...rows[0], branches: branchMap.get(rows[0].id) ?? [] }) })
 })
 
 const serviceSchema = z.object({
   name: z.string().min(1),
-  description: z.string().optional(),
+  description: z.string().max(20000).transform(cleanRichText).optional(),
   // Admin-typed translations — same "optional, falls back to English"
   // pattern as products.routes.js's productSchema.
   name_si: z.string().optional(),
   name_ta: z.string().optional(),
-  description_si: z.string().optional(),
-  description_ta: z.string().optional(),
+  description_si: z.string().max(20000).transform(cleanRichText).optional(),
+  description_ta: z.string().max(20000).transform(cleanRichText).optional(),
   price_lkr: z.number().nonnegative(),
+  discount_type: z.enum(['percent', 'fixed']).nullable().optional(),
+  discount_value: z.number().positive().nullable().optional(),
+  discount_starts_at: z.string().datetime({ offset: true }).nullable().optional(),
+  discount_ends_at: z.string().datetime({ offset: true }).nullable().optional(),
   service_type: z.enum(['bookable', 'purchasable']),
   duration_minutes: z.number().int().positive().optional(),
   category_id: z.string().uuid().nullable().optional(),
@@ -94,10 +123,12 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   if (s.service_type === 'bookable' && !s.duration_minutes) {
     return res.status(400).json({ error: 'duration_minutes is required for bookable services.' })
   }
+  const problem = discountProblem(s, s.price_lkr)
+  if (problem) return res.status(400).json({ error: problem })
 
   const { rows } = await query(
-    `INSERT INTO services (name, description, name_si, name_ta, description_si, description_ta, price_lkr, service_type, duration_minutes, category_id, badges, images, hover_video_url, hover_webp_url, hover_gif_url, detail_video_url, branch_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+    `INSERT INTO services (name, description, name_si, name_ta, description_si, description_ta, price_lkr, service_type, duration_minutes, category_id, badges, images, hover_video_url, hover_webp_url, hover_gif_url, detail_video_url, branch_id, discount_type, discount_value, discount_starts_at, discount_ends_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
     [
       s.name,
       s.description ?? null,
@@ -116,6 +147,10 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
       s.hover_gif_url ?? null,
       s.detail_video_url ?? null,
       s.branch_id ?? null,
+      s.discount_type ?? null,
+      s.discount_type ? s.discount_value ?? null : null,
+      s.discount_type ? s.discount_starts_at ?? null : null,
+      s.discount_type ? s.discount_ends_at ?? null : null,
     ]
   )
   await logBoth(req.user.id, 'service.created', rows[0].id)
@@ -126,6 +161,18 @@ router.put('/:id', requireRole('admin', 'superadmin'), async (req, res) => {
   const parsed = serviceSchema.partial().safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
   const fields = parsed.data
+  if ('discount_type' in fields || 'discount_value' in fields) {
+    if (!fields.discount_type) {
+      fields.discount_type = null
+      fields.discount_value = null
+      fields.discount_starts_at = null
+      fields.discount_ends_at = null
+    } else {
+      const price = fields.price_lkr ?? (await query('SELECT price_lkr FROM services WHERE id = $1', [req.params.id])).rows[0]?.price_lkr
+      const problem = discountProblem(fields, price)
+      if (problem) return res.status(400).json({ error: problem })
+    }
+  }
   const keys = Object.keys(fields)
   if (keys.length === 0) return res.status(400).json({ error: 'No fields to update.' })
 

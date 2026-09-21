@@ -158,6 +158,41 @@ router.put('/:id/set-main', requireRole('admin', 'superadmin'), async (req, res)
   res.json({ branch })
 })
 
+// Which services this branch offers. Customers booking a service choose
+// among the branches that offer it; a service offered nowhere can't be
+// booked. Send the full list each time (it replaces the previous list).
+router.get('/:id/services', requireRole('admin', 'superadmin'), async (req, res) => {
+  const { rows } = await query('SELECT service_id FROM service_branches WHERE branch_id = $1', [req.params.id])
+  res.json({ service_ids: rows.map((r) => r.service_id) })
+})
+
+router.put('/:id/services', requireRole('admin', 'superadmin'), async (req, res) => {
+  const parsed = z.object({ service_ids: z.array(z.string().uuid()).max(500) }).safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Please choose from the list of services.' })
+  const exists = await query('SELECT 1 FROM branches WHERE id = $1', [req.params.id])
+  if (!exists.rows[0]) return res.status(404).json({ error: 'Branch not found.' })
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query('DELETE FROM service_branches WHERE branch_id = $1', [req.params.id])
+    if (parsed.data.service_ids.length) {
+      await client.query(
+        `INSERT INTO service_branches (service_id, branch_id)
+         SELECT sid, $2 FROM unnest($1::uuid[]) AS sid WHERE EXISTS (SELECT 1 FROM services WHERE id = sid)`,
+        [parsed.data.service_ids, req.params.id]
+      )
+    }
+    await client.query('COMMIT')
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
+  await logBoth(req.user.id, 'branch.services_updated', req.params.id, { count: parsed.data.service_ids.length })
+  res.json({ ok: true })
+})
+
 // Opening hours for one branch. `hours` is an object keyed by day of week
 // (0 = Sunday ... 6 = Saturday); a missing day means closed. Send
 // { hours: null } to clear them (no restriction).

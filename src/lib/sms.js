@@ -1,3 +1,5 @@
+import { getServiceProvider, providerBranchLabel } from './serviceProvider.js'
+
 // Order/booking confirmation text messages. Uses Twilio's plain REST API
 // via fetch (no SDK dependency needed for something this simple). Same
 // fallback pattern as src/lib/email.js: if Twilio isn't configured, the
@@ -61,6 +63,8 @@ export async function sendOrderConfirmationSms(order, phone) {
 }
 
 export async function sendBookingConfirmationSms(booking, serviceName, phone) {
-  const body = `Shani'z: Your booking for ${serviceName} is confirmed for ${fmtDate(booking.booked_date)} at ${String(booking.booked_time).slice(0, 5)}.`
+  const provider = await getServiceProvider()
+  const where = booking.branch?.name ? ` at ${providerBranchLabel(provider, booking.branch.name)}` : ` with ${provider.name}`
+  const body = `Shani'z: Your booking for ${serviceName} is confirmed for ${fmtDate(booking.booked_date)} at ${String(booking.booked_time).slice(0, 5)}${where}.`
   return sendSms(phone, body)
 }

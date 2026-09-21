@@ -1,10 +1,11 @@
 import { Router } from 'express'
+import crypto from 'crypto'
 import { z } from 'zod'
 import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
-import { sendBookingConfirmationEmail, sendBookingUpdateEmail } from '../lib/email.js'
-import { sendBookingConfirmationSms } from '../lib/sms.js'
+import { sendBookingUpdateEmail } from '../lib/email.js'
+import { notifyBookingConfirmed } from '../lib/orderBookings.js'
 
 const router = Router()
 
@@ -26,9 +27,9 @@ const toTimeString = (mins) =>
 //  2. Whatever the source, times are cut to the branch's opening hours
 //     for that weekday, and a day the branch is closed has no slots.
 //  3. Blackout days (days off) and already-booked times are removed.
-async function computeSlots(serviceId, dateStr) {
+async function computeSlots(serviceId, dateStr, branchIdWanted) {
   const service = await query(
-    'SELECT id, duration_minutes, service_type, branch_id FROM services WHERE id = $1 AND is_active = TRUE',
+    'SELECT id, duration_minutes, service_type FROM services WHERE id = $1 AND is_active = TRUE',
     [serviceId]
   )
   if (!service.rows[0]) return { status: 404, error: 'Service not found.' }
@@ -38,20 +39,31 @@ async function computeSlots(serviceId, dateStr) {
   const duration = service.rows[0].duration_minutes
   const dayOfWeek = new Date(`${dateStr}T00:00:00Z`).getUTCDay()
 
+  // Which branch? A service is offered at the branches an admin ticked for it
+  // (Admin → Branches → Services offered here). If it's offered at just one,
+  // that one is used automatically; otherwise the customer must choose.
+  const offered = await query('SELECT branch_id FROM service_branches WHERE service_id = $1', [serviceId])
+  if (offered.rows.length === 0) {
+    return { status: 400, error: 'This service is not offered at any branch yet.' }
+  }
+  let branchId = branchIdWanted
+  if (!branchId && offered.rows.length === 1) branchId = offered.rows[0].branch_id
+  if (!branchId) return { status: 400, error: 'Please choose a branch.' }
+  if (!offered.rows.some((r) => r.branch_id === branchId)) {
+    return { status: 400, error: 'That service is not offered at the branch you chose.' }
+  }
+
   const blackout = await query(
     `SELECT 1 FROM service_blackouts
      WHERE blackout_date = $1 AND (service_id = $2 OR service_id IS NULL)`,
     [dateStr, serviceId]
   )
-  if (blackout.rows.length > 0) return { slots: [] }
+  if (blackout.rows.length > 0) return { slots: [], branchId }
 
-  let branchHours = null
-  if (service.rows[0].branch_id) {
-    const b = await query('SELECT opening_hours FROM branches WHERE id = $1', [service.rows[0].branch_id])
-    branchHours = b.rows[0]?.opening_hours ?? null
-  }
+  const b = await query('SELECT opening_hours FROM branches WHERE id = $1', [branchId])
+  const branchHours = b.rows[0]?.opening_hours ?? null
   const dayHours = branchHours ? branchHours[String(dayOfWeek)] : null
-  if (branchHours && !dayHours) return { slots: [] } // branch closed that day
+  if (branchHours && !dayHours) return { slots: [], branchId } // branch closed that day
 
   const own = await query(
     `SELECT start_time, end_time FROM service_availability
@@ -64,10 +76,13 @@ async function computeSlots(serviceId, dateStr) {
     if (anyOwn.rows.length === 0) windows = [{ start_time: dayHours.open, end_time: dayHours.close }]
   }
 
+  // Taken = confirmed/completed bookings, plus slots another customer is
+  // holding right now (in their basket / paying) that haven't run out yet.
   const booked = await query(
     `SELECT booked_time FROM bookings
-     WHERE service_id = $1 AND booked_date = $2 AND status != 'cancelled'`,
-    [serviceId, dateStr]
+     WHERE service_id = $1 AND booked_date = $2 AND branch_id = $3
+       AND status != 'cancelled' AND (status != 'held' OR held_until > now())`,
+    [serviceId, dateStr, branchId]
   )
   const bookedTimes = new Set(booked.rows.map((r) => r.booked_time))
 
@@ -85,7 +100,7 @@ async function computeSlots(serviceId, dateStr) {
       cursor += duration
     }
   }
-  return { slots }
+  return { slots, branchId }
 }
 
 // Public: open slots for a service on a given date. This is the
@@ -96,9 +111,65 @@ router.get('/services/:serviceId/slots', async (req, res) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr ?? '')) {
     return res.status(400).json({ error: 'date query param must be YYYY-MM-DD.' })
   }
-  const result = await computeSlots(req.params.serviceId, dateStr)
+  const branchId = /^[0-9a-f-]{36}$/i.test(req.query.branch_id ?? '') ? req.query.branch_id : undefined
+  const result = await computeSlots(req.params.serviceId, dateStr, branchId)
   if (result.error) return res.status(result.status).json({ error: result.error })
-  res.json({ date: dateStr, slots: result.slots })
+  res.json({ date: dateStr, branch_id: result.branchId, slots: result.slots })
+})
+
+// ---- Holding a slot while the customer pays ----
+// Pressing "Add to basket" on a bookable service reserves that slot for
+// HOLD_MINUTES. The booking is only CONFIRMED once payment succeeds (see
+// lib/orderBookings.js). If the hold runs out, the slot is released.
+export const HOLD_MINUTES = 20
+
+const holdSchema = z.object({
+  service_id: z.string().uuid('Something went wrong with that service — please try again.'),
+  branch_id: z.string().uuid('Please choose a branch.'),
+  booked_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Please pick a valid date.'),
+  booked_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/, 'Please pick one of the available times.'),
+})
+
+router.post('/hold', async (req, res) => {
+  const parsed = holdSchema.safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
+  const { service_id, branch_id, booked_date, booked_time } = parsed.data
+
+  // Free up any holds that have run out first, so their slots count as open.
+  await query(`UPDATE bookings SET status = 'cancelled' WHERE status = 'held' AND held_until <= now()`)
+
+  const check = await computeSlots(service_id, booked_date, branch_id)
+  if (check.error) return res.status(check.status).json({ error: check.error })
+  const wanted = booked_time.length === 5 ? `${booked_time}:00` : booked_time
+  if (!check.slots.includes(wanted)) {
+    return res.status(409).json({ error: "Sorry, that time isn't available any more — please pick another time." })
+  }
+
+  const token = crypto.randomBytes(16).toString('hex')
+  try {
+    const { rows } = await query(
+      `INSERT INTO bookings (service_id, branch_id, user_id, booked_date, booked_time, status, held_until, hold_token)
+       VALUES ($1, $2, $3, $4, $5, 'held', now() + make_interval(mins => $6), $7)
+       RETURNING id, held_until`,
+      [service_id, branch_id, req.user?.id ?? null, booked_date, wanted, HOLD_MINUTES, token]
+    )
+    res.status(201).json({ hold: { id: rows[0].id, token, expires_at: rows[0].held_until } })
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'That slot was just taken by someone else — please pick another.' })
+    }
+    throw err
+  }
+})
+
+// Let go of a hold (customer removed it from the basket or picked another time).
+router.delete('/hold/:id', async (req, res) => {
+  const token = String(req.body?.token ?? '')
+  await query(
+    `UPDATE bookings SET status = 'cancelled' WHERE id = $1 AND hold_token = $2 AND status = 'held' AND order_id IS NULL`,
+    [req.params.id, token]
+  )
+  res.json({ ok: true })
 })
 
 // Friendly, plain-language phone check (Sri Lankan numbers, with or
@@ -118,6 +189,7 @@ const phoneField = z.preprocess(
 )
 
 const bookingSchema = z.object({
+  branch_id: z.string().uuid('Please choose a branch.'),
   service_id: z.string().uuid('Something went wrong with that service — please close this window and try again.'),
   booked_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Please pick a valid date.'),
   booked_time: z.string().regex(/^\d{2}:\d{2}(:\d{2})?$/, 'Please pick one of the available times.'),
@@ -130,66 +202,38 @@ const bookingSchema = z.object({
   guest_home_phone: phoneField,
 })
 
-router.post('/', async (req, res) => {
+// Staff only: enter a booking by hand (e.g. taken over the phone / paid at the counter).
+// Customers book through the basket and pay first — see /hold above.
+router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const parsed = bookingSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
-  const { service_id, booked_date, booked_time, guest_name, guest_email, guest_mobile, guest_home_phone } = parsed.data
+  const { service_id, branch_id, booked_date, booked_time, guest_name, guest_email, guest_mobile, guest_home_phone } = parsed.data
 
-  if (!req.user && (!guest_name || !guest_email)) {
-    return res.status(400).json({ error: 'Please enter your name and email so we can send your booking confirmation.' })
+  if (!guest_name || !guest_email) {
+    return res.status(400).json({ error: "Please enter the customer's name and email." })
   }
-  // At least one way to reach the customer: a mobile or a home phone
-  // (a signed-in customer's saved mobile counts).
-  if (!guest_mobile && !guest_home_phone && !req.user?.mobile) {
-    return res.status(400).json({
-      error: 'Please give us at least one phone number — a mobile or a home phone — so we can reach you about your booking.',
-    })
+  if (!guest_mobile && !guest_home_phone) {
+    return res.status(400).json({ error: 'Please enter at least one phone number — a mobile or a home phone.' })
   }
-
-  // Re-check the time against the real opening hours / windows / days off
-  // (not just what the page showed), so a closed day can't be booked.
-  const check = await computeSlots(service_id, booked_date)
+  await query(`UPDATE bookings SET status = 'cancelled' WHERE status = 'held' AND held_until <= now()`)
+  const check = await computeSlots(service_id, booked_date, branch_id)
   if (check.error) return res.status(check.status).json({ error: check.error })
   const wanted = booked_time.length === 5 ? `${booked_time}:00` : booked_time
   if (!check.slots.includes(wanted)) {
-    return res.status(409).json({ error: "Sorry, that time isn't available any more — please pick another time." })
+    return res.status(409).json({ error: "That time isn't available — pick another." })
   }
 
   try {
     const { rows } = await query(
-      `INSERT INTO bookings (service_id, user_id, guest_name, guest_email, guest_mobile, guest_home_phone, booked_date, booked_time)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [
-        service_id,
-        req.user?.id ?? null,
-        req.user ? null : guest_name,
-        req.user ? null : guest_email,
-        guest_mobile ?? null,
-        guest_home_phone ?? null,
-        booked_date,
-        booked_time,
-      ]
+      `INSERT INTO bookings (service_id, branch_id, user_id, guest_name, guest_email, guest_mobile, guest_home_phone, booked_date, booked_time, status)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, $7, $8, 'confirmed') RETURNING *`,
+      [service_id, branch_id, guest_name, guest_email, guest_mobile ?? null, guest_home_phone ?? null, booked_date, wanted]
     )
-    await logBoth(req.user?.id ?? null, 'booking.created', rows[0].id)
-
-    const recipientEmail = req.user?.email ?? guest_email
-    const serviceRow = await query('SELECT name FROM services WHERE id = $1', [service_id])
-    if (recipientEmail) {
-      await sendBookingConfirmationEmail(rows[0], serviceRow.rows[0]?.name ?? 'Service', recipientEmail)
-    }
-    // Mobile is optional for both guests and logged-in customers — only
-    // sent if one is actually on file.
-    const recipientMobile = req.user?.mobile ?? guest_mobile
-    if (recipientMobile) {
-      await sendBookingConfirmationSms(rows[0], serviceRow.rows[0]?.name ?? 'Service', recipientMobile)
-    }
-
+    await logBoth(req.user.id, 'booking.created_by_staff', rows[0].id)
+    await notifyBookingConfirmed(rows[0].id)
     res.status(201).json({ booking: rows[0] })
   } catch (err) {
-    if (err.code === '23505') {
-      // unique_violation on (service_id, booked_date, booked_time)
-      return res.status(409).json({ error: 'That slot was just booked by someone else — pick another.' })
-    }
+    if (err.code === '23505') return res.status(409).json({ error: 'That slot is already booked.' })
     throw err
   }
 })
@@ -198,9 +242,11 @@ router.post('/', async (req, res) => {
 router.get('/mine', async (req, res) => {
   if (!req.user) return res.status(401).json({ error: 'Not signed in.' })
   const { rows } = await query(
-    `SELECT b.*, s.name AS service_name FROM bookings b
+    `SELECT b.*, s.name AS service_name, br.name AS branch_name, br.address AS branch_address
+     FROM bookings b
      JOIN services s ON s.id = b.service_id
-     WHERE b.user_id = $1 ORDER BY b.booked_date, b.booked_time`,
+     LEFT JOIN branches br ON br.id = b.branch_id
+     WHERE b.user_id = $1 AND b.status IN ('confirmed', 'completed') ORDER BY b.booked_date, b.booked_time`,
     [req.user.id]
   )
   res.json({ bookings: rows })
@@ -209,11 +255,14 @@ router.get('/mine', async (req, res) => {
 // Admin: calendar view of all upcoming bookings.
 router.get('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const { rows } = await query(
-    `SELECT b.*, s.name AS service_name, u.name AS user_name, u.email AS user_email, u.mobile AS user_mobile
+    `SELECT b.*, s.name AS service_name, br.name AS branch_name, u.name AS user_name, u.email AS user_email, u.mobile AS user_mobile,
+            o.customer_first_name, o.customer_last_name, o.customer_email AS order_email, o.customer_phone AS order_phone
      FROM bookings b
      JOIN services s ON s.id = b.service_id
+     LEFT JOIN branches br ON br.id = b.branch_id
+     LEFT JOIN orders o ON o.id = b.order_id
      LEFT JOIN users u ON u.id = b.user_id
-     WHERE b.booked_date >= CURRENT_DATE AND b.status != 'cancelled'
+     WHERE b.booked_date >= CURRENT_DATE AND b.status != 'cancelled' AND (b.status != 'held' OR b.held_until > now())
      ORDER BY b.booked_date, b.booked_time`
   )
   res.json({ bookings: rows })

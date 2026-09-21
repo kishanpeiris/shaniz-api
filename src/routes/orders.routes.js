@@ -13,6 +13,8 @@ import { getSuperadminEmails } from '../lib/notifications.js'
 import { maybeSendLowStockAlert } from '../lib/lowStockAlert.js'
 import { generateInvoicePdf } from '../lib/pdf.js'
 import { storePdf } from '../lib/uploads.js'
+import { syncBookingsWithOrderStatus } from '../lib/orderBookings.js'
+import { effectivePrice } from '../lib/pricing.js'
 
 // "What's stubbed" (SETUP-AND-DEPLOYMENT.md 4.1): "PDF invoices — the
 // invoices table and an invoice email exist, but nothing generates an
@@ -47,6 +49,10 @@ const lineItemSchema = z.object({
   type: z.enum(['product', 'service']),
   id: z.string().uuid(),
   qty: z.number().int().positive(),
+  // Bookable services carry the slot the customer reserved (see POST
+  // /api/bookings/hold) — payment confirms it.
+  hold_id: z.string().uuid().optional(),
+  hold_token: z.string().max(64).optional(),
 })
 
 // An address as entered at checkout — for both guests and logged-in
@@ -74,7 +80,9 @@ const orderSchema = z
     phone: z.string().min(7, 'A valid phone number is required.'),
 
     // Delivery
-    delivery_method: z.enum(['pickup', 'delivery']),
+    // Only needed when the order contains physical products — services
+    // (bookings, vouchers) are neither delivered nor collected.
+    delivery_method: z.enum(['pickup', 'delivery']).optional(),
     delivery_region: z.string().optional(), // required when delivery_method === 'delivery'
     pickup_branch_id: z.string().uuid().optional(), // required when delivery_method === 'pickup'
     shipping_address_id: z.string().uuid().optional(), // pick a saved address (logged-in only)
@@ -95,6 +103,10 @@ const orderSchema = z
     // store and charge later via their Charging API). Worth a follow-up
     // task once basic checkout is live and working.
     save_card: z.boolean().optional().default(false),
+  })
+  .refine((d) => !d.items.some((i) => i.type === 'product') || Boolean(d.delivery_method), {
+    message: 'Choose home delivery or pickup for your products.',
+    path: ['delivery_method'],
   })
   .refine((d) => d.delivery_method !== 'delivery' || isValidRegion(d.delivery_region), {
     message: 'A valid delivery region is required for home delivery.',
@@ -167,14 +179,15 @@ router.post('/', async (req, res) => {
     await client.query('BEGIN')
 
     const resolvedItems = []
+    const heldBookingIds = []
     const stockCrossingChecks = [] // resolved after COMMIT — see below
     let subtotal = 0
 
     for (const item of d.items) {
       const table = item.type === 'product' ? 'products' : 'services'
       const { rows } = await client.query(
-        `SELECT id, name, price_lkr${
-          item.type === 'product' ? ', stock_qty, low_stock_threshold, availability_mode, preorder_eta_days' : ''
+        `SELECT id, name, price_lkr, discount_type, discount_value, discount_starts_at, discount_ends_at${
+          item.type === 'product' ? ', stock_qty, low_stock_threshold, availability_mode, preorder_eta_days' : ', service_type'
         } FROM ${table} WHERE id = $1 AND is_active = TRUE FOR UPDATE`,
         [item.id]
       )
@@ -214,7 +227,33 @@ router.post('/', async (req, res) => {
         }
       }
 
-      const unitPrice = Number(record.price_lkr)
+      // The price always comes from the database (including any live
+      // discount) — never from what the browser sent.
+      const unitPrice = effectivePrice(record)
+
+      // A bookable service must come with a slot the customer reserved.
+      let bookingInfo = null
+      if (item.type === 'service' && record.service_type === 'bookable') {
+        if (!item.hold_id || !item.hold_token) {
+          throw new HttpError(400, `Please choose a branch, date and time for "${record.name}".`)
+        }
+        if (item.qty !== 1) throw new HttpError(400, 'Each booking is for one appointment — add another booking for a second person.')
+        if (heldBookingIds.includes(item.hold_id)) throw new HttpError(400, 'The same booking is in your basket twice.')
+        const h = await client.query(
+          `SELECT b.id, b.status, b.held_until, b.order_id, b.branch_id, to_char(b.booked_date, 'YYYY-MM-DD') AS date_str,
+                  to_char(b.booked_time, 'HH24:MI') AS time_str, br.name AS branch_name, br.address AS branch_address
+           FROM bookings b LEFT JOIN branches br ON br.id = b.branch_id
+           WHERE b.id = $1 AND b.hold_token = $2 AND b.service_id = $3 FOR UPDATE OF b`,
+          [item.hold_id, item.hold_token, item.id]
+        )
+        const hold = h.rows[0]
+        if (!hold || hold.status !== 'held' || hold.order_id || new Date(hold.held_until) <= new Date()) {
+          throw new HttpError(409, `Your reserved time for "${record.name}" has run out — please choose a time again.`)
+        }
+        heldBookingIds.push(hold.id)
+        bookingInfo = { id: hold.id, date: hold.date_str, time: hold.time_str, branch_id: hold.branch_id, branch_name: hold.branch_name, branch_address: hold.branch_address }
+      }
+
       subtotal += unitPrice * item.qty
       resolvedItems.push({
         type: item.type,
@@ -222,6 +261,7 @@ router.post('/', async (req, res) => {
         name: record.name,
         unit_price_lkr: unitPrice,
         qty: item.qty,
+        ...(bookingInfo ? { booking: bookingInfo } : {}),
         ...(isPreorder ? { is_preorder: true, preorder_eta_date: preorderEtaDate } : {}),
       })
     }
@@ -259,7 +299,7 @@ router.post('/', async (req, res) => {
       pickupBranch = rows[0]
     }
 
-    const fee = deliveryFee(d.delivery_method, d.delivery_region)
+    const fee = d.delivery_method ? deliveryFee(d.delivery_method, d.delivery_region) : 0
     const total = subtotal + fee
     const customerEmail = req.user?.email ?? d.guest_email
 
@@ -280,7 +320,7 @@ router.post('/', async (req, res) => {
         d.last_name,
         d.phone,
         customerEmail,
-        d.delivery_method,
+        d.delivery_method ?? null,
         d.delivery_method === 'delivery' ? d.delivery_region : null,
         d.delivery_method === 'pickup' ? d.pickup_branch_id : null,
         fee,
@@ -290,6 +330,15 @@ router.post('/', async (req, res) => {
         req.ip,
       ]
     )
+
+    // The reserved slots now belong to this order; give the customer time to pay.
+    if (heldBookingIds.length) {
+      await client.query(
+        `UPDATE bookings SET order_id = $1, user_id = COALESCE(user_id, $2), held_until = now() + interval '45 minutes'
+         WHERE id = ANY($3::uuid[])`,
+        [orderRows[0].id, userId, heldBookingIds]
+      )
+    }
 
     const order = { ...orderRows[0], pickup_branch: pickupBranch }
 
@@ -639,6 +688,7 @@ router.post('/:id/sandbox-pay', async (req, res) => {
     [mappedStatus, txnId, order.id]
   )
   await logAudit(order.user_id, `sandbox_pay.${mappedStatus}`, order.id, { gateway: order.gateway_used })
+  await syncBookingsWithOrderStatus(order.id, mappedStatus)
 
   // Simulates the gateway's tokenization callback that would normally
   // save a real card token — see project-spec.md Section 0/7: only ever
@@ -719,6 +769,7 @@ router.put('/:id/status', requireRole('admin', 'superadmin'), async (req, res) =
   if (!rows[0]) return res.status(404).json({ error: 'Order not found.' })
   let order = rows[0]
   await logBoth(req.user.id, 'order.status_changed', order.id, { status: parsed.data.status })
+  await syncBookingsWithOrderStatus(order.id, parsed.data.status)
 
   const recipientEmail = order.customer_email ?? (await resolveOrderEmail(order))
   if (recipientEmail) {

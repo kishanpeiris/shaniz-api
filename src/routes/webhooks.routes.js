@@ -5,6 +5,7 @@ import { logAudit } from '../lib/log.js'
 import { sendInvoiceEmail } from '../lib/email.js'
 import { attachPickupBranch } from '../lib/pickupBranch.js'
 import { ensureInvoice } from './orders.routes.js'
+import { syncBookingsWithOrderStatus } from '../lib/orderBookings.js'
 
 const router = Router()
 
@@ -90,6 +91,7 @@ router.post('/payhere', async (req, res) => {
     [mappedStatus, paymentId, orderId]
   )
   await logAudit(null, `webhook.payhere.${mappedStatus}`, orderId, { status_code: statusCode, payment_id: paymentId })
+  await syncBookingsWithOrderStatus(orderId, mappedStatus)
 
   const order = rows[0]
   if (order && mappedStatus === 'paid') {
@@ -157,6 +159,7 @@ router.post('/:gateway', async (req, res) => {
     [mappedStatus, transaction_id ?? null, order_id]
   )
   await logAudit(null, `webhook.${gateway}.${mappedStatus}`, order_id, { transaction_id })
+  await syncBookingsWithOrderStatus(order_id, mappedStatus)
 
   const order = rows[0]
   if (order && mappedStatus === 'paid') {

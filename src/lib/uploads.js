@@ -172,6 +172,20 @@ export async function processAndStoreHoverImage(file) {
   return storeBuffer(buffer, ext, contentType, 'image')
 }
 
+// A brand logo (e.g. the services provider's logo). Unlike gallery photos
+// this is NOT flattened to JPEG: it is kept as WebP, which preserves a
+// transparent background so the logo sits cleanly on any thumbnail. Capped
+// at 800x400 - a logo is only ever shown small.
+export async function processAndStoreLogo(file) {
+  validate(file)
+  const buffer = await sharp(file.buffer, { limitInputPixels: 268402689 })
+    .rotate()
+    .resize({ width: 800, height: 400, fit: 'inside', withoutEnlargement: true })
+    .webp({ quality: 90 })
+    .toBuffer()
+  return storeBuffer(buffer, 'webp', 'image/webp', 'image')
+}
+
 // Looping hover-thumbnail videos. Unlike the old WebM-only version of
 // this function, any common video format in is accepted and ffmpeg
 // (via ffmpeg-static, a self-contained binary — no system package to

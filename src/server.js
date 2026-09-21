@@ -20,6 +20,9 @@ import { apiLimiter } from './middleware/rateLimit.js'
 import { startLogPurgeJob } from './lib/logPurge.js'
 import { loadRegions } from './lib/delivery.js'
 import { startBookingReminderJob } from './lib/bookingReminders.js'
+import { startCartReminderJob } from './lib/cartReminders.js'
+import { startBookingHoldJob } from './lib/orderBookings.js'
+import emailPrefsRoutes from './routes/emailPrefs.routes.js'
 
 import authRoutes from './routes/auth.routes.js'
 import productRoutes from './routes/products.routes.js'
@@ -37,6 +40,16 @@ import reviewRoutes from './routes/reviews.routes.js'
 import { localUploadDir, isCloudinaryConfigured } from './lib/uploads.js'
 
 const app = express()
+
+// On Render / Railway / Vercel the app sits behind the host's proxy. Without
+// this line every visitor looks like they come from the proxy's one address,
+// so the rate limiters (login: 5 tries, password reset: 3 tries per 15 min)
+// were shared by EVERYONE, and every order stored the proxy's IP for fraud
+// checks. With it, Express reads the visitor's real address from the proxy.
+// TRUST_PROXY_HOPS = how many proxies sit in front of the app (1 on Render).
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS) || 1)
+}
 
 // ---- Security headers (spec Section 7) ----
 // A dedicated package like `helmet` is worth adding once you deploy —
@@ -92,6 +105,7 @@ app.use('/api/bookings', bookingRoutes)
 app.use('/api/orders', orderRoutes)
 app.use('/api/site', siteRoutes)
 app.use('/api/account', accountRoutes)
+app.use('/api/email-prefs', emailPrefsRoutes)
 app.use('/api/uploads', uploadRoutes)
 // Defines its own two paths (/api/products/:id/reviews, /api/reviews/:id)
 // rather than sitting under one fixed prefix, so it's mounted at the
@@ -101,6 +115,18 @@ app.use('/api/admin', requireRole('admin', 'superadmin'), adminRoutes)
 
 // ---- error handler (last) ----
 app.use((err, req, res, next) => {
+  // Problems caused by what the visitor sent are the visitor's error (4xx),
+  // not ours (500) — and don't need a scary stack trace in the logs.
+  if (err.code === '22P02' || err.code === '22007' || err.code === '22008') {
+    // Postgres: a malformed id (not a UUID) or date in the URL
+    return res.status(400).json({ error: 'That link or value is not valid.' })
+  }
+  if (err.type === 'entity.too.large' || err.status === 413) {
+    return res.status(413).json({ error: 'That request is too large.' })
+  }
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'The request could not be read.' })
+  }
   console.error(err)
   res.status(500).json({ error: 'Something went wrong on our end.' })
 })
@@ -114,5 +140,7 @@ loadRegions().then(() => {
     console.log(`Shani'z API listening on http://localhost:${port}`)
     startLogPurgeJob()
     startBookingReminderJob()
+    startCartReminderJob()
+    startBookingHoldJob()
   })
 })

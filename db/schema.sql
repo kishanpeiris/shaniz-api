@@ -438,6 +438,24 @@ CREATE TABLE IF NOT EXISTS saved_carts (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Basket-reminder bookkeeping: how many reminder emails have gone out for
+-- the current basket, and when the last one was sent. Both reset whenever
+-- the customer changes their basket (see PUT /api/account/cart).
+ALTER TABLE saved_carts ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ;
+ALTER TABLE saved_carts ADD COLUMN IF NOT EXISTS reminders_sent INTEGER NOT NULL DEFAULT 0;
+
+-- Emails a person has opted out of, by type (e.g. 'cart_reminders').
+-- Keyed by email address (not user id) so it also works for guests who
+-- click "unsubscribe" in an email, and survives an account being deleted.
+-- Order, payment, account-security and booking-confirmation emails are
+-- transactional and are NOT covered by this table.
+CREATE TABLE IF NOT EXISTS email_suppressions (
+  email      TEXT NOT NULL,
+  type       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (email, type)
+);
+
 CREATE TABLE IF NOT EXISTS bookings (
   id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   service_id   UUID NOT NULL REFERENCES services(id),
@@ -776,3 +794,99 @@ SET value = ('{
   "ritual_video_subtext_ta": "ஒவ்வொரு தொகுதியும் எவ்வாறு கலக்கப்படுகிறது என்பதற்கான சுருக்கமான காட்சி — புதிய இலையிலிருந்து முடிக்கப்பட்ட பாட்டில் வரை."
 }'::jsonb) || value
 WHERE key = 'homepage_content';
+
+
+-- ======================================================================
+-- Discounts, editable ingredients, and services offered at several branches
+-- (with pay-upfront bookings). Every statement is safe to re-run.
+-- ======================================================================
+
+-- One-time data changes are remembered here so re-running the migration
+-- never redoes (or undoes) something an admin has since changed.
+CREATE TABLE IF NOT EXISTS schema_seeds (
+  name   TEXT PRIMARY KEY,
+  ran_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ---- Discounts (products and services) ----
+-- discount_type 'percent' (value 1-95) or 'fixed' (rupees off). Optional
+-- start/end dates; blank = always on until removed.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS discount_type TEXT CHECK (discount_type IN ('percent', 'fixed'));
+ALTER TABLE products ADD COLUMN IF NOT EXISTS discount_value NUMERIC(12, 2) CHECK (discount_value IS NULL OR discount_value > 0);
+ALTER TABLE products ADD COLUMN IF NOT EXISTS discount_starts_at TIMESTAMPTZ;
+ALTER TABLE products ADD COLUMN IF NOT EXISTS discount_ends_at TIMESTAMPTZ;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS discount_type TEXT CHECK (discount_type IN ('percent', 'fixed'));
+ALTER TABLE services ADD COLUMN IF NOT EXISTS discount_value NUMERIC(12, 2) CHECK (discount_value IS NULL OR discount_value > 0);
+ALTER TABLE services ADD COLUMN IF NOT EXISTS discount_starts_at TIMESTAMPTZ;
+ALTER TABLE services ADD COLUMN IF NOT EXISTS discount_ends_at TIMESTAMPTZ;
+
+-- ---- "Inside the jar" ingredients, now editable per product ----
+ALTER TABLE products ADD COLUMN IF NOT EXISTS ingredients TEXT[] NOT NULL DEFAULT '{}';
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_seeds WHERE name = 'prebuilt-product-details-v1') THEN
+    -- These two demo products used to have their ingredient list and badge
+    -- hard-coded in the website, which made them impossible to edit. Copy
+    -- them into the database once, so they can now be changed or removed.
+    UPDATE products SET ingredients = ARRAY['Coconut Oil', 'Neem & Dill', 'Curry Leaves', 'Rosemary', 'Natural preservatives'],
+                        badges = CASE WHEN COALESCE(array_length(badges, 1), 0) = 0 THEN ARRAY['100% Herbal'] ELSE badges END
+      WHERE name = 'Aangraa Hair Oil';
+    UPDATE products SET ingredients = ARRAY['Amla', 'Rosemary', 'Curry Leaf', 'Mint & Bay', 'Dried whole herbs'],
+                        badges = CASE WHEN COALESCE(array_length(badges, 1), 0) = 0 THEN ARRAY['100% Natural'] ELSE badges END
+      WHERE name = 'Premium Herbal Hair Mask';
+    INSERT INTO schema_seeds (name) VALUES ('prebuilt-product-details-v1');
+  END IF;
+END $$;
+
+-- ---- Which branches offer which service ----
+CREATE TABLE IF NOT EXISTS service_branches (
+  service_id UUID NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+  branch_id  UUID NOT NULL REFERENCES branches(id) ON DELETE CASCADE,
+  PRIMARY KEY (service_id, branch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_service_branches_branch ON service_branches (branch_id);
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_seeds WHERE name = 'service-branches-from-single-branch-v1') THEN
+    -- Copy the old "one branch per service" setting across, once.
+    INSERT INTO service_branches (service_id, branch_id)
+      SELECT id, branch_id FROM services WHERE branch_id IS NOT NULL
+      ON CONFLICT DO NOTHING;
+    INSERT INTO schema_seeds (name) VALUES ('service-branches-from-single-branch-v1');
+  END IF;
+END $$;
+
+-- ---- Bookings: which branch, and "held while the customer pays" ----
+-- A booking is 'held' (slot reserved) while the customer is in checkout /
+-- paying, and becomes 'confirmed' only once payment succeeds. A hold that
+-- runs out is cancelled automatically so the slot frees up again.
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS branch_id UUID REFERENCES branches(id) ON DELETE SET NULL;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS held_until TIMESTAMPTZ;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS hold_token TEXT;
+ALTER TABLE bookings DROP CONSTRAINT IF EXISTS bookings_status_check;
+ALTER TABLE bookings ADD CONSTRAINT bookings_status_check CHECK (status IN ('held', 'confirmed', 'completed', 'cancelled'));
+-- The same service can now run at the same time in two different branches,
+-- so the "one booking per slot" rule is per service AND branch.
+DROP INDEX IF EXISTS bookings_active_slot_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS bookings_active_slot_unique_v2
+  ON bookings (service_id, (COALESCE(branch_id, '00000000-0000-0000-0000-000000000000'::uuid)), booked_date, booked_time)
+  WHERE status != 'cancelled';
+CREATE INDEX IF NOT EXISTS idx_bookings_held ON bookings (held_until) WHERE status = 'held';
+
+
+-- ======================================================================
+-- Service provider (the subsidiary that delivers all services).
+-- One row, edited from Admin -> Services. "{name}" inside a wording line
+-- is replaced with the name. ON CONFLICT DO NOTHING = re-running the
+-- migration never overwrites what an admin has since changed.
+-- Branches (above) are the provider's branches: every appointment is
+-- shown as "<provider name> - <branch name>".
+-- ======================================================================
+INSERT INTO site_settings (key, value) VALUES ('service_provider', '{
+  "name": "Miracles Hair and Skin Clinic",
+  "logo_url": "",
+  "wording_en": "Provided by {name}",
+  "wording_si": "{name} විසින් සපයනු ලබන සේවාවකි",
+  "wording_ta": "{name} வழங்கும் சேவை"
+}')
+  ON CONFLICT (key) DO NOTHING;

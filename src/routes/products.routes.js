@@ -4,6 +4,8 @@ import { query } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
 import { maybeSendLowStockAlert } from '../lib/lowStockAlert.js'
+import { cleanRichText } from '../lib/sanitize.js'
+import { withSalePrice, discountProblem } from '../lib/pricing.js'
 
 const router = Router()
 
@@ -46,7 +48,8 @@ router.get('/', async (req, res) => {
   const includeInactive = isAdmin && req.query.all === 'true'
   const { rows } = await query(
     `SELECT p.id, p.name, p.description, p.name_si, p.name_ta, p.description_si, p.description_ta,
-            p.price_lkr, p.stock_qty, p.category, p.category_id,
+            p.price_lkr, p.stock_qty, p.category, p.category_id, p.ingredients,
+            p.discount_type, p.discount_value, p.discount_starts_at, p.discount_ends_at,
             c.name AS category_name, c.parent_id AS category_parent_id, p.badges, p.images,
             p.hover_gif_url, p.hover_video_url, p.hover_webp_url, p.detail_video_url, p.is_active,
             p.image_focal_x, p.image_focal_y,
@@ -70,7 +73,7 @@ router.get('/', async (req, res) => {
   // category: resolved display name — a real category's name if one is
   // set, otherwise whatever legacy free-text value the product already
   // had (see the migration note on the categories table in schema.sql).
-  res.json({ products: rows.map((r) => ({ ...r, category: r.category_name || r.category })) })
+  res.json({ products: rows.map((r) => withSalePrice({ ...r, category: r.category_name || r.category })) })
 })
 
 router.get('/:id', async (req, res) => {
@@ -91,21 +94,26 @@ router.get('/:id', async (req, res) => {
   )
   if (!rows[0]) return res.status(404).json({ error: 'Product not found.' })
   const row = rows[0]
-  res.json({ product: { ...row, category: row.category_name || row.category } })
+  res.json({ product: withSalePrice({ ...row, category: row.category_name || row.category }) })
 })
 
 const productSchema = z.object({
   name: z.string().min(1),
-  description: z.string().optional(),
+  description: z.string().max(20000).transform(cleanRichText).optional(),
   // Admin-typed translations (no auto-translate — see
   // SESSION-SUMMARY.md). All optional: a product with these left blank
   // just falls back to the English name/description on the storefront,
   // it never shows empty.
   name_si: z.string().optional(),
   name_ta: z.string().optional(),
-  description_si: z.string().optional(),
-  description_ta: z.string().optional(),
+  description_si: z.string().max(20000).transform(cleanRichText).optional(),
+  description_ta: z.string().max(20000).transform(cleanRichText).optional(),
   price_lkr: z.number().nonnegative(),
+  discount_type: z.enum(['percent', 'fixed']).nullable().optional(),
+  discount_value: z.number().positive().nullable().optional(),
+  discount_starts_at: z.string().datetime({ offset: true }).nullable().optional(),
+  discount_ends_at: z.string().datetime({ offset: true }).nullable().optional(),
+  ingredients: z.array(z.string().trim().min(1).max(80)).max(30).optional(),
   stock_qty: z.number().int().nonnegative().default(0),
   category: z.string().optional(),
   category_id: z.string().uuid().nullable().optional(),
@@ -139,10 +147,12 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
   const parsed = productSchema.safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
   const p = parsed.data
+  const problem = discountProblem(p, p.price_lkr)
+  if (problem) return res.status(400).json({ error: problem })
 
   const { rows } = await query(
-    `INSERT INTO products (name, description, name_si, name_ta, description_si, description_ta, price_lkr, stock_qty, category, category_id, badges, images, hover_gif_url, hover_video_url, hover_webp_url, detail_video_url, availability_mode, preorder_eta_days)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+    `INSERT INTO products (name, description, name_si, name_ta, description_si, description_ta, price_lkr, stock_qty, category, category_id, badges, images, hover_gif_url, hover_video_url, hover_webp_url, detail_video_url, availability_mode, preorder_eta_days, ingredients, discount_type, discount_value, discount_starts_at, discount_ends_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
     [
       p.name,
       p.description ?? null,
@@ -162,6 +172,11 @@ router.post('/', requireRole('admin', 'superadmin'), async (req, res) => {
       p.detail_video_url ?? null,
       p.availability_mode ?? 'in_stock',
       p.preorder_eta_days ?? null,
+      p.ingredients ?? [],
+      p.discount_type ?? null,
+      p.discount_type ? p.discount_value ?? null : null,
+      p.discount_type ? p.discount_starts_at ?? null : null,
+      p.discount_type ? p.discount_ends_at ?? null : null,
     ]
   )
   await logBoth(req.user.id, 'product.created', rows[0].id)
@@ -172,6 +187,19 @@ router.put('/:id', requireRole('admin', 'superadmin'), async (req, res) => {
   const parsed = productSchema.partial().safeParse(req.body)
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message })
   const fields = parsed.data
+  if ('discount_type' in fields || 'discount_value' in fields) {
+    if (!fields.discount_type) {
+      // discount switched off: clear the rest of it too
+      fields.discount_type = null
+      fields.discount_value = null
+      fields.discount_starts_at = null
+      fields.discount_ends_at = null
+    } else {
+      const price = fields.price_lkr ?? (await query('SELECT price_lkr FROM products WHERE id = $1', [req.params.id])).rows[0]?.price_lkr
+      const problem = discountProblem(fields, price)
+      if (problem) return res.status(400).json({ error: problem })
+    }
+  }
   const keys = Object.keys(fields)
   if (keys.length === 0) return res.status(400).json({ error: 'No fields to update.' })
 

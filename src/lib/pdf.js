@@ -1,5 +1,6 @@
 import PDFDocument from 'pdfkit'
 import { googleMapsLink } from './pickupBranch.js'
+import { getServiceProvider, providerBranchLabel } from './serviceProvider.js'
 
 // Spec Section 2 / "What's stubbed": "Invoice generation (PDF, auto or
 // on-demand)." The `invoices` table and an invoice EMAIL already
@@ -24,7 +25,9 @@ const fmtDate = (d) => {
 // nothing is written to disk here, storage is a separate concern
 // (see storePdf in lib/uploads.js) so this function is easy to test on
 // its own with just an order object.
-export function generateInvoicePdf(order) {
+export async function generateInvoicePdf(order) {
+  // Appointment lines on the invoice name the company that provides them.
+  const provider = await getServiceProvider()
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', margin: 50 })
     const chunks = []
@@ -97,7 +100,10 @@ export function generateInvoicePdf(order) {
     for (const item of order.items || []) {
       const lineTotal = Number(item.unit_price_lkr) * Number(item.qty)
       doc.fontSize(10)
-      doc.text(item.name, col.name, y, { width: 280 })
+      const label = item.booking
+        ? `${item.name} — ${item.booking.date} ${String(item.booking.time).slice(0, 5)}, ${providerBranchLabel(provider, item.booking.branch_name)}`
+        : item.name
+      doc.text(label, col.name, y, { width: 280 })
       doc.text(String(item.qty), col.qty, y)
       doc.text(fmt(item.unit_price_lkr), col.price, y)
       doc.text(fmt(lineTotal), col.total, y)

@@ -1,7 +1,7 @@
 import { Router } from 'express'
 import multer from 'multer'
 import { requireRole } from '../middleware/auth.js'
-import { processAndStoreImage, processAndStoreHoverImage, processAndStoreVideo, UploadError } from '../lib/uploads.js'
+import { processAndStoreImage, processAndStoreHoverImage, processAndStoreLogo, processAndStoreVideo, UploadError } from '../lib/uploads.js'
 import { logActivity } from '../lib/log.js'
 
 const router = Router()
@@ -36,6 +36,22 @@ router.post('/', requireRole('admin', 'superadmin'), upload.single('file'), asyn
 router.post('/hover-image', requireRole('admin', 'superadmin'), upload.single('file'), async (req, res) => {
   try {
     const url = await processAndStoreHoverImage(req.file)
+    await logActivity(req.user.id, 'image.uploaded')
+    res.status(201).json({ url })
+  } catch (err) {
+    if (err instanceof UploadError) return res.status(err.status).json({ error: err.message })
+    if (err.message?.includes('Input buffer')) {
+      return res.status(400).json({ error: 'That file could not be read as an image.' })
+    }
+    throw err
+  }
+})
+
+// Admin-only: a brand logo. Kept as transparent WebP (never flattened to
+// JPEG) so it looks right on top of any photo.
+router.post('/logo', requireRole('admin', 'superadmin'), upload.single('file'), async (req, res) => {
+  try {
+    const url = await processAndStoreLogo(req.file)
     await logActivity(req.user.id, 'image.uploaded')
     res.status(201).json({ url })
   } catch (err) {

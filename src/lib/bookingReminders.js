@@ -1,6 +1,7 @@
 import cron from 'node-cron'
 import { query } from '../db/pool.js'
 import { sendBookingReminderEmail } from './email.js'
+import { isSuppressed } from './emailPrefs.js'
 
 // Day-before booking reminder emails. Same "runs inside the Node process"
 // pattern as src/lib/logPurge.js — if your Postgres host supports pg_cron
@@ -43,6 +44,7 @@ export function startBookingReminderJob() {
       let sent = 0
       for (const row of rows) {
         const toEmail = row.user_email ?? row.guest_email
+        if (toEmail && (await isSuppressed(toEmail, 'booking_reminders'))) continue // opted out
         if (!toEmail) continue // no email on file — nothing to send, leave reminder_sent as-is so it's easy to spot in a query if this ever matters
         try {
           await sendBookingReminderEmail(row, row.service_name, toEmail)

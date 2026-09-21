@@ -73,7 +73,8 @@ export const addressAutocompleteLimiter = rateLimit({
 // A gentler general limiter for the rest of the API.
 export const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  limit: 100,
+  // per visitor per minute; raise with API_RATE_LIMIT_PER_MIN if many people share one address (an office, a mobile carrier)
+  limit: Number(process.env.API_RATE_LIMIT_PER_MIN) || 100,
   standardHeaders: true,
   legacyHeaders: false,
 })
