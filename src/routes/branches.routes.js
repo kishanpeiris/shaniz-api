@@ -2,6 +2,7 @@ import { Router } from 'express'
 import { z } from 'zod'
 import { query, pool } from '../db/pool.js'
 import { requireRole } from '../middleware/auth.js'
+import { addressAutocompleteLimiter } from '../middleware/rateLimit.js'
 import { logBoth } from '../lib/log.js'
 
 const router = Router()
@@ -31,19 +32,28 @@ router.get('/', async (req, res) => {
 // throttled) — the exact "Geocoding service returned an error" failure
 // this was hitting. LocationIQ's free tier is normal API-key access, no
 // such shared-IP penalty.
-async function geocodeWithLocationIQ(address, apiKey) {
-  const url = `https://us1.locationiq.com/v1/search?key=${apiKey}&format=json&limit=1&q=${encodeURIComponent(address)}`
+// countrycodes=lk on both providers — every branch is in Sri Lanka (see
+// project-spec.md), so this keeps results relevant and stops a search
+// like "Main Street" from matching a same-named road on the other side
+// of the world. `limit` defaults to 1 for the one-shot "Find on map"
+// button below, and is passed as a higher number by the live-suggestions
+// endpoint further down.
+async function geocodeWithLocationIQ(address, apiKey, limit = 1) {
+  const url = `https://us1.locationiq.com/v1/search?key=${apiKey}&format=json&limit=${limit}&countrycodes=lk&q=${encodeURIComponent(address)}`
   const response = await fetch(url, { headers: { Accept: 'application/json' } })
   const body = await response.json().catch(() => null)
   if (!response.ok) {
+    // LocationIQ returns 404 with a body for "no results" — not really
+    // an error, so the autocomplete endpoint below can treat it as [].
+    if (response.status === 404) return []
     console.error('[geocode] LocationIQ error', response.status, body)
     throw new Error(`LocationIQ returned ${response.status}`)
   }
   return body
 }
 
-async function geocodeWithNominatim(address) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`
+async function geocodeWithNominatim(address, limit = 1) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=${limit}&countrycodes=lk&q=${encodeURIComponent(address)}`
   const response = await fetch(url, {
     headers: {
       'User-Agent': 'ShanizAdminPanel/1.0 (branch location lookup)',
@@ -57,6 +67,39 @@ async function geocodeWithNominatim(address) {
   }
   return body
 }
+
+// Live suggestions as the admin types a branch address (same idea as the
+// checkout/account address autocomplete in lib/geocode.js, kept separate
+// here since this one returns the FULL display_name — a branch address
+// is one single field, not split into line1/city/postcode like checkout).
+// Picking a suggestion on the frontend fills the address text AND moves
+// the map pin in one step, same as clicking a result on the map.
+router.get('/address-autocomplete', requireRole('admin', 'superadmin'), addressAutocompleteLimiter, async (req, res) => {
+  const parsed = z.string().trim().min(3).max(200).safeParse(req.query.q)
+  if (!parsed.success) return res.json({ suggestions: [] })
+
+  const apiKey = process.env.GEOCODING_API_KEY
+  try {
+    let results
+    try {
+      results = apiKey
+        ? await geocodeWithLocationIQ(parsed.data, apiKey, 6)
+        : await geocodeWithNominatim(parsed.data, 6)
+    } catch (primaryErr) {
+      if (apiKey) results = await geocodeWithNominatim(parsed.data, 6)
+      else throw primaryErr
+    }
+    const suggestions = (results || []).map((r) => ({
+      label: r.display_name,
+      latitude: Number(r.lat),
+      longitude: Number(r.lon),
+    }))
+    res.json({ suggestions })
+  } catch (err) {
+    console.error('[branches address-autocomplete] failed:', err.message)
+    res.json({ suggestions: [] }) // fail quiet — typing the address by hand still works
+  }
+})
 
 router.get('/geocode', requireRole('admin', 'superadmin'), async (req, res) => {
   const address = z.string().min(1).safeParse(req.query.address)

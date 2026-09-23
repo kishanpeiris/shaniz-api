@@ -890,3 +890,48 @@ INSERT INTO site_settings (key, value) VALUES ('service_provider', '{
   "wording_ta": "{name} வழங்கும் சேவை"
 }')
   ON CONFLICT (key) DO NOTHING;
+
+-- ======================================================================
+-- Backfill: products from before the categories feature existed (or
+-- created by db:seed-catalog, which only ever wrote the old free-text
+-- products.category column, never category_id) have a category that
+-- displays fine on the product list, but was never a real row in the
+-- categories table -- so it never showed up as something selectable
+-- in Admin -> Products/Services' category picker or its "Manage
+-- categories" list. This looked like previously-saved categories had
+-- vanished, when really they had just never been "promoted" into the
+-- categories table added later. Runs once (schema_seeds guard, see
+-- above): after this, an admin renaming or deleting the resulting
+-- category is a normal edit, not something a later db:migrate undoes.
+-- Services never had a free-text category column (category_id was the
+-- only mechanism from the start), so there is nothing to backfill there.
+-- ======================================================================
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM schema_seeds WHERE name = 'backfill-legacy-product-categories-v1') THEN
+    -- One category row per distinct legacy name still in use by a
+    -- product with no category_id yet. NOT EXISTS (rather than a
+    -- unique-constraint ON CONFLICT, since categories.name isn't
+    -- unique) keeps this re-run-safe on its own even without the
+    -- schema_seeds guard above.
+    INSERT INTO categories (kind, name)
+      SELECT DISTINCT 'product', p.category
+      FROM products p
+      WHERE p.category_id IS NULL
+        AND p.category IS NOT NULL
+        AND btrim(p.category) <> ''
+        AND NOT EXISTS (
+          SELECT 1 FROM categories c WHERE c.kind = 'product' AND c.name = p.category
+        );
+
+    -- Point each such product at the (now-existing) matching category.
+    UPDATE products p
+    SET category_id = c.id
+    FROM categories c
+    WHERE p.category_id IS NULL
+      AND c.kind = 'product'
+      AND c.name = p.category;
+
+    INSERT INTO schema_seeds (name) VALUES ('backfill-legacy-product-categories-v1');
+  END IF;
+END $$;

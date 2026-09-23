@@ -9,6 +9,13 @@ import { logBoth, logActivity } from '../lib/log.js'
 import { sendPasswordResetEmail, sendVerificationEmail } from '../lib/email.js'
 import { serializeUser } from '../lib/serializeUser.js'
 import { requireAuth } from '../middleware/auth.js'
+import { verifyRecaptcha } from '../lib/recaptcha.js'
+
+// After this many failed sign-in attempts for the same email within 15
+// minutes, the frontend must include a solved reCAPTCHA token before
+// we'll even check the password. Deliberately lower than loginLimiter's
+// hard cutoff (5) — this is an earlier, softer speed bump, not the wall.
+const CAPTCHA_AFTER_FAILURES = 2
 
 const router = Router()
 
@@ -138,6 +145,26 @@ router.post('/login', loginLimiter, async (req, res) => {
   const { password } = parsed.data
   const ip = req.ip
 
+  // Spec Section 7 rate limiting + reCAPTCHA: check this email's recent
+  // failed attempts BEFORE touching the password. Real customers who
+  // mistype their password once or twice never see a checkbox; repeat
+  // failures (the shape of a brute-force script or a stolen password
+  // list) do.
+  const { rows: recentFailures } = await query(
+    `SELECT COUNT(*)::int AS count FROM login_attempts
+     WHERE LOWER(email) = $1 AND success = false AND created_at > now() - interval '15 minutes'`,
+    [email]
+  )
+  if (recentFailures[0].count >= CAPTCHA_AFTER_FAILURES) {
+    const captchaOk = await verifyRecaptcha(req.body?.recaptchaToken, ip)
+    if (!captchaOk) {
+      return res.status(400).json({
+        error: 'Please complete the verification below.',
+        captchaRequired: true,
+      })
+    }
+  }
+
   const { rows } = await query(
     `SELECT id, name, first_name, last_name, email, mobile, password_hash, role, disabled, email_verified, language_pref, created_at
      FROM users WHERE LOWER(email) = $1`,
@@ -156,7 +183,13 @@ router.post('/login', loginLimiter, async (req, res) => {
     if (user) {
       await logBoth(user.id, 'auth.login_failed', 'self', { ip })
     }
-    return res.status(401).json({ error: 'Incorrect email or password.' })
+    // This failed attempt was just recorded above, so tell the frontend
+    // whether to keep (or start) showing the checkbox on the next try.
+    const captchaNowRequired = recentFailures[0].count + 1 >= CAPTCHA_AFTER_FAILURES
+    return res.status(401).json({
+      error: 'Incorrect email or password.',
+      captchaRequired: captchaNowRequired,
+    })
   }
 
   const token = signSession(user)

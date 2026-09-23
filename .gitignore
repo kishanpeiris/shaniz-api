@@ -1,6 +1,18 @@
-node_modules
+# Real secrets — DATABASE_URL, JWT_SECRET, RECAPTCHA_SECRET_KEY, payment
+# gateway keys, etc. .env.example (no real values) is fine to commit;
+# this file is not. See SETUP-AND-DEPLOYMENT.md Step 2.
 .env
-*.log
+.env.*
+!.env.example
 
-# Local image-upload fallback (dev only — production uses Cloudinary)
-/uploads
+node_modules/
+
+# Local-disk upload fallback (see src/lib/uploads.js) — only used when
+# Cloudinary isn't configured; never meant to be committed either way.
+uploads/*
+!uploads/.gitkeep
+
+# Editor/OS noise
+.DS_Store
+*.log
+npm-debug.log*

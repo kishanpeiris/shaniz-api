@@ -15,6 +15,20 @@ export function verifySession(token) {
   return jwt.verify(token, process.env.JWT_SECRET)
 }
 
+// True once a session is more than a few minutes old. Used by
+// attachUser to decide whether to silently reissue the cookie on an
+// authenticated request, turning the fixed 2-hour expiry above into a
+// genuine rolling/idle timeout: someone actively using the admin panel
+// (loading a page, saving, uploading an image) never hits the 2-hour
+// wall, since every such request pushes it back out another 2 hours.
+// Only truly stopping for 2 hours signs them out. The 5-minute floor
+// just avoids re-signing/re-setting the cookie on every single request
+// in a quick burst (e.g. a page that fires several GETs at once).
+const REFRESH_AFTER_SECONDS = 5 * 60
+export function shouldRefreshSession(payload) {
+  return Date.now() / 1000 - payload.iat > REFRESH_AFTER_SECONDS
+}
+
 export function setSessionCookie(res, token) {
   const isProd = process.env.NODE_ENV === 'production'
   res.cookie(SESSION_COOKIE, token, {

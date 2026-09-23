@@ -1,4 +1,4 @@
-import { SESSION_COOKIE, verifySession } from '../lib/session.js'
+import { SESSION_COOKIE, verifySession, signSession, setSessionCookie, shouldRefreshSession } from '../lib/session.js'
 import { query } from '../db/pool.js'
 
 // Attaches req.user if a valid session cookie is present. Does not
@@ -18,6 +18,13 @@ export async function attachUser(req, res, next) {
     const user = rows[0]
     if (user && !user.disabled) {
       req.user = user
+      // Rolling session: quietly extend the cookie so an admin who is
+      // actively working (even just clicking around, no explicit "keep
+      // me signed in" action needed) is never logged out mid-task. Only
+      // real inactivity for the full 2 hours ends the session.
+      if (shouldRefreshSession(payload)) {
+        setSessionCookie(res, signSession(user))
+      }
     }
   } catch {
     // invalid/expired token — treat as logged out, don't throw
