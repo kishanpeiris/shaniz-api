@@ -11,6 +11,10 @@ export const OPTIONAL_EMAIL_TYPES = {
     label: 'Basket reminders',
     description: 'One friendly reminder if you leave items in your basket for 3 days.',
   },
+  checkout_reminders: {
+    label: 'Checkout reminders',
+    description: 'One reminder if you start checkout but the payment is never completed.',
+  },
   booking_reminders: {
     label: 'Booking reminders',
     description: 'A reminder the day before an appointment you have booked.',

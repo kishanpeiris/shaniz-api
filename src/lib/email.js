@@ -229,6 +229,31 @@ export async function sendCartReminderEmail(toEmail, firstName, items) {
   return send({ to: toEmail, subject: 'Your Shani\u2019z basket is waiting', html, unsubscribe: optUrl })
 }
 
+// Unlike sendCartReminderEmail (basket never made it to checkout), this
+// is for someone who filled in the whole checkout form — address,
+// delivery method, payment gateway chosen — and the order exists, but
+// no payment webhook ever confirmed it. Covers guest checkouts too,
+// since customer_email is captured on every order regardless of
+// whether the customer has an account.
+export async function sendCheckoutReminderEmail(order, toEmail, firstName) {
+  const optUrl = unsubscribeUrl(toEmail, 'checkout_reminders')
+  const items = Array.isArray(order.items) ? order.items : []
+  const rows = items
+    .map((i) => `<tr><td style="padding:6px 0;">${esc(i.name)} × ${Number(i.qty) || 1}</td></tr>`)
+    .join('')
+  const html = layout(
+    'Finish your order?',
+    `
+      <p>Hi${firstName ? ` ${esc(firstName)}` : ''}, you started an order with us but the payment was never completed:</p>
+      <table style="width:100%; border-collapse:collapse;">${rows}</table>
+      <p style="margin-top:20px;"><a href="${process.env.FRONTEND_ORIGIN}/payment/${order.id}" style="background:#2b3a2f; color:#fff; padding:10px 22px; border-radius:20px; text-decoration:none;">Complete payment</a></p>
+      <p style="font-size:13px; color:#5c5949;">Prices, stock and any preorder dates are checked again when you complete payment. If you no longer want this order, you can simply ignore this email — nothing has been charged.</p>
+    `,
+    { url: optUrl, label: 'Stop checkout reminders' }
+  )
+  return send({ to: toEmail, subject: 'Finish your Shani\u2019z order?', html, unsubscribe: optUrl })
+}
+
 export async function sendBookingUpdateEmail(booking, serviceName, toEmail) {
   const statusText =
     booking.status === 'cancelled'

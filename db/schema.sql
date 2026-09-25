@@ -444,6 +444,14 @@ CREATE TABLE IF NOT EXISTS saved_carts (
 ALTER TABLE saved_carts ADD COLUMN IF NOT EXISTS last_reminder_at TIMESTAMPTZ;
 ALTER TABLE saved_carts ADD COLUMN IF NOT EXISTS reminders_sent INTEGER NOT NULL DEFAULT 0;
 
+-- Abandoned-checkout reminders: an order that stays 'pending' (created,
+-- but payment never confirmed by a gateway webhook) for a while gets ONE
+-- reminder email pointing back to /payment/:orderId. Unlike saved_carts,
+-- this covers GUEST checkouts too, since customer_email is captured at
+-- order creation for both guest and logged-in orders — see
+-- src/lib/checkoutReminders.js.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_reminder_sent_at TIMESTAMPTZ;
+
 -- Emails a person has opted out of, by type (e.g. 'cart_reminders').
 -- Keyed by email address (not user id) so it also works for guests who
 -- click "unsubscribe" in an email, and survives an account being deleted.

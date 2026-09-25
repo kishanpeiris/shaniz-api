@@ -21,6 +21,7 @@ import { startLogPurgeJob } from './lib/logPurge.js'
 import { loadRegions } from './lib/delivery.js'
 import { startBookingReminderJob } from './lib/bookingReminders.js'
 import { startCartReminderJob } from './lib/cartReminders.js'
+import { startCheckoutReminderJob } from './lib/checkoutReminders.js'
 import { startBookingHoldJob } from './lib/orderBookings.js'
 import emailPrefsRoutes from './routes/emailPrefs.routes.js'
 
@@ -141,6 +142,7 @@ loadRegions().then(() => {
     startLogPurgeJob()
     startBookingReminderJob()
     startCartReminderJob()
+    startCheckoutReminderJob()
     startBookingHoldJob()
   })
 })
