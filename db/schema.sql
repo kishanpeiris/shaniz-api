@@ -452,6 +452,37 @@ ALTER TABLE saved_carts ADD COLUMN IF NOT EXISTS reminders_sent INTEGER NOT NULL
 -- src/lib/checkoutReminders.js.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_reminder_sent_at TIMESTAMPTZ;
 
+-- First-party page-view counter for the admin dashboard (Section 8: "not
+-- vanity metrics", but total traffic and top pages are useful alongside
+-- the money/order metrics already there, and Google Analytics data isn't
+-- something the admin API can query directly without a separate OAuth
+-- integration — this is the simple, self-contained alternative). One
+-- row per page view, written by POST /api/site/pageview (see
+-- site.routes.js), fired from the frontend's router on every navigation.
+CREATE TABLE IF NOT EXISTS page_views (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  path       TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views (created_at);
+
+-- VIP customers: a baseline percentage discount, admin-adjustable per
+-- customer, applied automatically at checkout. 0 = not VIP (the normal
+-- case for every existing customer — this migration doesn't change
+-- anyone's status). A single percent column rather than a separate
+-- is_vip boolean: "is this customer VIP" is just "is this > 0", so
+-- there's nothing to keep in sync between two fields.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS vip_discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0
+  CHECK (vip_discount_percent >= 0 AND vip_discount_percent <= 100);
+
+-- Snapshotted onto the order at checkout (not just read live from
+-- users.vip_discount_percent) so an order's own record stays accurate
+-- even if the customer's discount rate is changed by an admin later —
+-- same "snapshot everything real money depended on" approach already
+-- used for shipping_address/billing_address on this table.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS vip_discount_percent NUMERIC(5,2) NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_lkr NUMERIC(12,2) NOT NULL DEFAULT 0;
+
 -- Emails a person has opted out of, by type (e.g. 'cart_reminders').
 -- Keyed by email address (not user id) so it also works for guests who
 -- click "unsubscribe" in an email, and survives an account being deleted.
@@ -648,17 +679,17 @@ INSERT INTO site_settings (key, value) VALUES ('business_info', '{
 -- so nothing on the live site changes until an admin actually edits it.
 INSERT INTO site_settings (key, value) VALUES ('homepage_content', '{
   "hero_eyebrow": "Small-batch · Sri Lankan grown",
-  "hero_headline": "Ceylon''s herbal ritual, bottled by hand.",
-  "hero_subtext": "Amla, curry leaf, neem and rosemary — blended the way our grandmothers did, for hair that remembers what it''s like to be cared for.",
-  "hero_cta1_label": "Shop the Ritual",
+  "hero_headline": "Herbal hair care from Sri Lanka, bottled by hand.",
+  "hero_subtext": "Amla, curry leaf, neem and rosemary, blended the way our grandmothers did, for hair that gets the care it deserves.",
+  "hero_cta1_label": "Shop Now",
   "hero_cta2_label": "Watch It Being Made",
   "about_eyebrow": "Our story",
   "about_headline": "Rooted in the same soil\nas ayurveda itself.",
-  "about_paragraph1": "Shani''z started at a kitchen table, boiling curry leaf and rosemary the way it had been done in our family for three generations — not as a trend, but as a habit of care. Every batch is still small enough to stir by hand, so the herbs stay whole and the oils stay honest.",
-  "about_paragraph2": "We don''t chase long ingredient lists. We chase the ones that work: amla for strength, neem for the scalp, curry leaf for shine, rosemary for growth. Nothing else needs to be in the jar.",
+  "about_paragraph1": "Shani''z started at a kitchen table, boiling curry leaf and rosemary the way our family had done for three generations. It was a habit of care long before it was a trend. Every batch is still small enough to stir by hand, so the herbs stay whole and the oils stay honest.",
+  "about_paragraph2": "We keep ingredient lists short and use the ones that work: amla for strength, neem for the scalp, curry leaf for shine, rosemary for growth. Nothing else goes in the jar.",
   "ritual_eyebrow": "The Ritual",
   "ritual_headline": "Shop what''s in the jar.",
-  "ritual_subtext": "Two staples to start with — an oil for the scalp, a mask for the strands. Hover a product to see what''s inside."
+  "ritual_subtext": "Two staples to start with: an oil for the scalp and a mask for the strands. Hover a product to see what''s inside."
 }')
   ON CONFLICT (key) DO NOTHING;
 
@@ -794,10 +825,10 @@ SET value = ('{
   "ritual_video_eyebrow": "See it made",
   "ritual_video_eyebrow_si": "සාදන ආකාරය",
   "ritual_video_eyebrow_ta": "தயாரிப்பு முறை",
-  "ritual_video_headline": "The ritual, start to finish.",
+  "ritual_video_headline": "How each batch is made.",
   "ritual_video_headline_si": "චාරිත්‍රය, ආරම්භයේ සිට අවසානය දක්වා.",
   "ritual_video_headline_ta": "சடங்கு, தொடக்கம் முதல் முடிவு வரை.",
-  "ritual_video_subtext": "A short look at how each batch is blended — from fresh leaf to finished bottle.",
+  "ritual_video_subtext": "A short look at how each batch is blended, from fresh leaf to finished bottle.",
   "ritual_video_subtext_si": "සෑම තොගයක්ම මිශ්‍ර කරන ආකාරය පිළිබඳ කෙටි දසුනක් — නැවුම් කොළයේ සිට නිමි බෝතලය දක්වා.",
   "ritual_video_subtext_ta": "ஒவ்வொரு தொகுதியும் எவ்வாறு கலக்கப்படுகிறது என்பதற்கான சுருக்கமான காட்சி — புதிய இலையிலிருந்து முடிக்கப்பட்ட பாட்டில் வரை."
 }'::jsonb) || value
@@ -943,3 +974,48 @@ BEGIN
     INSERT INTO schema_seeds (name) VALUES ('backfill-legacy-product-categories-v1');
   END IF;
 END $$;
+
+-- ---------------------------------------------------------------------
+-- Discount codes. A customer types a code at checkout; the server (never
+-- the browser) checks it and works out the discount. Stacks with the VIP
+-- discount and, like it, never applies to the delivery fee.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS discount_codes (
+  id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  code               TEXT NOT NULL CHECK (code ~ '^[A-Z0-9_-]{3,32}$'),
+  description        TEXT,
+  discount_type      TEXT NOT NULL CHECK (discount_type IN ('percent', 'fixed')),
+  discount_value     NUMERIC(12,2) NOT NULL CHECK (discount_value > 0),
+  min_subtotal_lkr   NUMERIC(12,2) NOT NULL DEFAULT 0 CHECK (min_subtotal_lkr >= 0),
+  expires_at         TIMESTAMPTZ,            -- NULL = never expires
+  max_total_uses     INTEGER CHECK (max_total_uses IS NULL OR max_total_uses > 0),
+  one_per_customer   BOOLEAN NOT NULL DEFAULT TRUE,
+  is_active          BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (discount_type <> 'percent' OR discount_value <= 100)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS discount_codes_code_unique ON discount_codes (upper(code));
+
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_code_id UUID REFERENCES discount_codes(id) ON DELETE SET NULL;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_code TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS code_discount_lkr NUMERIC(12,2) NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS orders_discount_code_idx ON orders (discount_code_id) WHERE discount_code_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------
+-- Wishlist: one row per saved product/service per customer. Guests keep
+-- theirs in their own browser; it is merged in here when they sign in.
+-- (No foreign key on item_id because it points at two different tables;
+-- the routes only ever return items that still exist and are active.)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS wishlist_items (
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  item_type  TEXT NOT NULL CHECK (item_type IN ('product', 'service')),
+  item_id    UUID NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS wishlist_items_item_idx ON wishlist_items (item_type, item_id);
+
+-- Which wishlist items have already been mentioned in a reminder email, so
+-- the same item is never emailed about twice.
+ALTER TABLE wishlist_items ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMPTZ;

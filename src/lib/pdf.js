@@ -113,6 +113,19 @@ export async function generateInvoicePdf(order) {
     doc.moveTo(50, y + 4).lineTo(545, y + 4).strokeColor('#c9a35c').stroke()
     y += 14
 
+    if (Number(order.discount_lkr) > 0) {
+      doc.fontSize(10).fillColor('#5c5949')
+      doc.text(`VIP discount (${Number(order.vip_discount_percent)}%)`, col.price, y)
+      doc.text('-' + fmt(order.discount_lkr), col.total, y)
+      y += 18
+    }
+    if (Number(order.code_discount_lkr) > 0) {
+      doc.fontSize(10).fillColor('#5c5949')
+      doc.text(`Discount code (${order.discount_code})`, col.price, y)
+      doc.text('-' + fmt(order.code_discount_lkr), col.total, y)
+      y += 18
+    }
+
     if (Number(order.delivery_fee_lkr) > 0) {
       doc.fontSize(10).fillColor('#5c5949')
       doc.text('Delivery', col.price, y)

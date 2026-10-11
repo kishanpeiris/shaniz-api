@@ -21,5 +21,7 @@ export function serializeUser(row) {
     languagePref: row.language_pref || 'en',
     disabled: Boolean(row.disabled),
     createdAt: row.created_at ?? null,
+    // 0 = not VIP. Admin-adjustable, see PUT /api/admin/customers/:id/vip-discount.
+    vipDiscountPercent: Number(row.vip_discount_percent ?? 0),
   }
 }

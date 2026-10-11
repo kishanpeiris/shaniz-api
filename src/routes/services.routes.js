@@ -5,6 +5,8 @@ import { requireRole } from '../middleware/auth.js'
 import { logBoth } from '../lib/log.js'
 import { cleanRichText } from '../lib/sanitize.js'
 import { withSalePrice, discountProblem } from '../lib/pricing.js'
+import { branchesByService } from '../lib/branches.js'
+import { getRelatedItems, resolveCategoryName } from '../lib/related.js'
 
 const router = Router()
 
@@ -22,24 +24,6 @@ const UNITS_SOLD_SUBQUERY = `
 `
 
 
-// Which branches offer each service (from the service_branches table).
-// Returns Map(serviceId -> [{ id, name, address, latitude, longitude, phone }]).
-async function branchesByService(serviceIds) {
-  const { rows } = await query(
-    `SELECT sb.service_id, b.id, b.name, b.address, b.latitude, b.longitude, b.phone
-     FROM service_branches sb JOIN branches b ON b.id = sb.branch_id
-     ${serviceIds ? 'WHERE sb.service_id = ANY($1::uuid[])' : ''}
-     ORDER BY b.name`,
-    serviceIds ? [serviceIds] : []
-  )
-  const map = new Map()
-  for (const r of rows) {
-    const { service_id, ...branch } = r
-    if (!map.has(service_id)) map.set(service_id, [])
-    map.get(service_id).push(branch)
-  }
-  return map
-}
 
 router.get('/', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
@@ -67,6 +51,16 @@ router.get('/', async (req, res) => {
 
 // Public detail view — same shape as GET /api/products/:id, used by the
 // new ServiceDetailPage.
+// "You might also like" for this service's detail page — same rules as
+// the product version, see src/lib/related.js.
+router.get('/:id/related', async (req, res) => {
+  const { rows } = await query('SELECT 1 FROM services WHERE id = $1 AND is_active = TRUE', [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Service not found.' })
+  const categoryName = await resolveCategoryName('service', req.params.id)
+  const items = await getRelatedItems({ type: 'service', id: req.params.id, categoryName })
+  res.json({ items })
+})
+
 router.get('/:id', async (req, res) => {
   const isAdmin = req.user && ['admin', 'superadmin'].includes(req.user.role)
   const { rows } = await query(

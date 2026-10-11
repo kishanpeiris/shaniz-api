@@ -6,6 +6,7 @@ import { logBoth } from '../lib/log.js'
 import { maybeSendLowStockAlert } from '../lib/lowStockAlert.js'
 import { cleanRichText } from '../lib/sanitize.js'
 import { withSalePrice, discountProblem } from '../lib/pricing.js'
+import { getRelatedItems, resolveCategoryName } from '../lib/related.js'
 
 const router = Router()
 
@@ -74,6 +75,16 @@ router.get('/', async (req, res) => {
   // set, otherwise whatever legacy free-text value the product already
   // had (see the migration note on the categories table in schema.sql).
   res.json({ products: rows.map((r) => withSalePrice({ ...r, category: r.category_name || r.category })) })
+})
+
+// "You might also like" for this product's detail page — see
+// src/lib/related.js for the selection rules.
+router.get('/:id/related', async (req, res) => {
+  const { rows } = await query('SELECT 1 FROM products WHERE id = $1 AND is_active = TRUE', [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Product not found.' })
+  const categoryName = await resolveCategoryName('product', req.params.id)
+  const items = await getRelatedItems({ type: 'product', id: req.params.id, categoryName })
+  res.json({ items })
 })
 
 router.get('/:id', async (req, res) => {

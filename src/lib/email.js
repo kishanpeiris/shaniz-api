@@ -135,7 +135,7 @@ export async function sendOrderConfirmationEmail(order, toEmail) {
       (i) =>
         `<tr><td style="padding:6px 0;">${esc(i.name)} × ${i.qty}${
           i.is_preorder
-            ? `<br/><span style="font-size:12px; color:#8a6d3b;">Pre-order — estimated arrival ${i.preorder_eta_date}</span>`
+            ? `<br/><span style="font-size:12px; color:#8a6d3b;">Pre-order: estimated arrival ${i.preorder_eta_date}</span>`
             : ''
         }${
           i.booking
@@ -153,14 +153,22 @@ export async function sendOrderConfirmationEmail(order, toEmail) {
       <p>Thank you for your order! Here's a summary:</p>
       <p style="font-size:13px; color:#5c5949;">Order ID: ${order.id}</p>
       ${pickupBranchHtml(order)}
-      <table style="width:100%; border-collapse:collapse; margin: 16px 0;">${rows}
+      <table style="width:100%; border-collapse:collapse; margin: 16px 0;">${rows}${
+        Number(order.discount_lkr) > 0
+          ? `<tr><td style="padding-top:6px; color:#5c5949;">VIP discount (${Number(order.vip_discount_percent)}%)</td><td style="padding-top:6px; text-align:right; color:#5c5949;">-${fmt(order.discount_lkr)}</td></tr>`
+          : ''
+      }${
+        Number(order.code_discount_lkr) > 0
+          ? `<tr><td style="padding-top:6px; color:#5c5949;">Discount code (${esc(order.discount_code)})</td><td style="padding-top:6px; text-align:right; color:#5c5949;">-${fmt(order.code_discount_lkr)}</td></tr>`
+          : ''
+      }
         <tr><td style="padding-top:10px; font-weight:bold;">Total</td>
             <td style="padding-top:10px; font-weight:bold; text-align:right;">${fmt(order.total_lkr)}</td></tr>
       </table>
       <p>Status: <strong>${order.status}</strong></p>
     `
   )
-  return send({ to: toEmail, subject: `Order confirmation — ${order.id.slice(0, 8)}`, html })
+  return send({ to: toEmail, subject: `Order confirmation: ${order.id.slice(0, 8)}`, html })
 }
 
 export async function sendShippingNoticeEmail(order, toEmail) {
@@ -168,7 +176,7 @@ export async function sendShippingNoticeEmail(order, toEmail) {
     'Your Order Has Shipped',
     `<p>Order <strong>${order.id.slice(0, 8)}</strong> is on its way.</p>`
   )
-  return send({ to: toEmail, subject: `Your order has shipped — ${order.id.slice(0, 8)}`, html })
+  return send({ to: toEmail, subject: `Your order has shipped: ${order.id.slice(0, 8)}`, html })
 }
 
 export async function sendBookingConfirmationEmail(booking, serviceName, toEmail) {
@@ -190,7 +198,7 @@ export async function sendBookingConfirmationEmail(booking, serviceName, toEmail
       <p style="font-size:13px; color:#5c5949;">Booking ID: ${booking.id}</p>
     `
   )
-  return send({ to: toEmail, subject: `Booking confirmed — ${serviceName}`, html })
+  return send({ to: toEmail, subject: `Booking confirmed: ${serviceName}`, html })
 }
 
 export async function sendBookingReminderEmail(booking, serviceName, toEmail) {
@@ -229,6 +237,30 @@ export async function sendCartReminderEmail(toEmail, firstName, items) {
   return send({ to: toEmail, subject: 'Your Shani\u2019z basket is waiting', html, unsubscribe: optUrl })
 }
 
+// "Still thinking about these?" — sent by src/lib/wishlistReminders.js.
+// `items` = [{ type, id, name, price }]; at most 5 are listed.
+export async function sendWishlistReminderEmail(toEmail, firstName, items, moreCount = 0) {
+  const optUrl = unsubscribeUrl(toEmail, 'wishlist_reminders')
+  const rows = items
+    .map(
+      (i) =>
+        `<tr><td style="padding:8px 0;"><a href="${process.env.FRONTEND_ORIGIN}/${i.type === 'service' ? 'service' : 'product'}/${i.id}" style="color:#2b3a2f;">${esc(i.name)}</a></td><td style="padding:8px 0; text-align:right;">${fmt(i.price)}</td></tr>`
+    )
+    .join('')
+  const html = layout(
+    'Still thinking about these?',
+    `
+      <p>Hi${firstName ? ` ${esc(firstName)}` : ''}, a few things you saved to your wishlist are still available:</p>
+      <table style="width:100%; border-collapse:collapse;">${rows}</table>
+      ${moreCount > 0 ? `<p style="font-size:13px; color:#5c5949;">…and ${moreCount} more on your wishlist.</p>` : ''}
+      <p style="margin-top:20px;"><a href="${process.env.FRONTEND_ORIGIN}/wishlist" style="background:#2b3a2f; color:#fff; padding:10px 22px; border-radius:20px; text-decoration:none;">View your wishlist</a></p>
+      <p style="font-size:13px; color:#5c5949;">Prices and availability are checked again at checkout. This is a one-time reminder.</p>
+    `,
+    { url: optUrl, label: 'Stop wishlist reminders' }
+  )
+  return send({ to: toEmail, subject: 'Your Shani\u2019z wishlist', html, unsubscribe: optUrl })
+}
+
 // Unlike sendCartReminderEmail (basket never made it to checkout), this
 // is for someone who filled in the whole checkout form — address,
 // delivery method, payment gateway chosen — and the order exists, but
@@ -260,7 +292,7 @@ export async function sendBookingUpdateEmail(booking, serviceName, toEmail) {
       ? 'has been cancelled'
       : `is now scheduled for ${fmtDate(booking.booked_date)} at ${booking.booked_time}`
   const html = layout('Booking Update', `<p><strong>${esc(serviceName)}</strong> ${statusText}.</p>`)
-  return send({ to: toEmail, subject: `Booking update — ${serviceName}`, html })
+  return send({ to: toEmail, subject: `Booking update: ${serviceName}`, html })
 }
 
 export async function sendPasswordResetEmail(toEmail, resetUrl) {
@@ -377,7 +409,7 @@ export async function sendInvoiceEmail(order, toEmail, pdfUrl) {
      ${pickupBranchHtml(order)}
      ${pdfUrl ? `<p><a href="${pdfUrl}" style="color:#2b3a2f;">Download invoice (PDF)</a></p>` : ''}`
   )
-  return send({ to: toEmail, subject: `Invoice — ${order.id.slice(0, 8)}`, html })
+  return send({ to: toEmail, subject: `Invoice: ${order.id.slice(0, 8)}`, html })
 }
 
 // Order cancellation/return requests — a customer's request never

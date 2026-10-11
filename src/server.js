@@ -21,6 +21,7 @@ import { startLogPurgeJob } from './lib/logPurge.js'
 import { loadRegions } from './lib/delivery.js'
 import { startBookingReminderJob } from './lib/bookingReminders.js'
 import { startCartReminderJob } from './lib/cartReminders.js'
+import { startWishlistReminderJob } from './lib/wishlistReminders.js'
 import { startCheckoutReminderJob } from './lib/checkoutReminders.js'
 import { startBookingHoldJob } from './lib/orderBookings.js'
 import emailPrefsRoutes from './routes/emailPrefs.routes.js'
@@ -32,6 +33,8 @@ import categoryRoutes from './routes/categories.routes.js'
 import branchRoutes from './routes/branches.routes.js'
 import bookingRoutes from './routes/bookings.routes.js'
 import orderRoutes from './routes/orders.routes.js'
+import { customerRouter as wishlistRoutes, adminRouter as wishlistAdminRoutes } from './routes/wishlist.routes.js'
+import { publicRouter as discountCodePublicRoutes, adminRouter as discountCodeAdminRoutes } from './routes/discountCodes.routes.js'
 import webhookRoutes from './routes/webhooks.routes.js'
 import adminRoutes from './routes/admin.routes.js'
 import siteRoutes from './routes/site.routes.js'
@@ -104,6 +107,8 @@ app.use('/api/categories', categoryRoutes)
 app.use('/api/branches', branchRoutes)
 app.use('/api/bookings', bookingRoutes)
 app.use('/api/orders', orderRoutes)
+app.use('/api/wishlist', wishlistRoutes)
+app.use('/api/discount-codes', discountCodePublicRoutes)
 app.use('/api/site', siteRoutes)
 app.use('/api/account', accountRoutes)
 app.use('/api/email-prefs', emailPrefsRoutes)
@@ -112,6 +117,8 @@ app.use('/api/uploads', uploadRoutes)
 // rather than sitting under one fixed prefix, so it's mounted at the
 // bare /api root instead of alongside the other single-resource routes.
 app.use('/api', reviewRoutes)
+app.use('/api/admin/wishlist', requireRole('admin', 'superadmin'), wishlistAdminRoutes)
+app.use('/api/admin/discount-codes', requireRole('admin', 'superadmin'), discountCodeAdminRoutes)
 app.use('/api/admin', requireRole('admin', 'superadmin'), adminRoutes)
 
 // ---- error handler (last) ----
@@ -142,6 +149,7 @@ loadRegions().then(() => {
     startLogPurgeJob()
     startBookingReminderJob()
     startCartReminderJob()
+    startWishlistReminderJob()
     startCheckoutReminderJob()
     startBookingHoldJob()
   })

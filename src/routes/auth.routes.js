@@ -85,7 +85,7 @@ router.post('/register', async (req, res) => {
   const { rows } = await query(
     `INSERT INTO users (name, first_name, last_name, email, mobile, password_hash, role)
      VALUES ($1, $2, $3, $4, $5, $6, 'customer')
-     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at`,
+     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at, vip_discount_percent`,
     [name, firstName, lastName ?? null, email, mobile ?? null, passwordHash]
   )
   const user = rows[0]
@@ -166,7 +166,7 @@ router.post('/login', loginLimiter, async (req, res) => {
   }
 
   const { rows } = await query(
-    `SELECT id, name, first_name, last_name, email, mobile, password_hash, role, disabled, email_verified, language_pref, created_at
+    `SELECT id, name, first_name, last_name, email, mobile, password_hash, role, disabled, email_verified, language_pref, created_at, vip_discount_percent
      FROM users WHERE LOWER(email) = $1`,
     [email]
   )

@@ -17,7 +17,7 @@ router.use(requireAuth)
 // ---- Profile ----
 router.get('/profile', async (req, res) => {
   const { rows } = await query(
-    `SELECT id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at
+    `SELECT id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at, vip_discount_percent
      FROM users WHERE id = $1`,
     [req.user.id]
   )
@@ -42,7 +42,7 @@ router.put('/profile', async (req, res) => {
   const { rows } = await query(
     `UPDATE users SET name = $1, first_name = $2, last_name = $3, mobile = $4
      WHERE id = $5
-     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at`,
+     RETURNING id, name, first_name, last_name, email, mobile, role, email_verified, language_pref, disabled, created_at, vip_discount_percent`,
     [name, firstName, lastName || null, mobile || null, req.user.id]
   )
   await logActivity(req.user.id, 'account.profile_updated')

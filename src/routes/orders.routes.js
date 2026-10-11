@@ -15,6 +15,7 @@ import { generateInvoicePdf } from '../lib/pdf.js'
 import { storePdf } from '../lib/uploads.js'
 import { syncBookingsWithOrderStatus } from '../lib/orderBookings.js'
 import { effectivePrice } from '../lib/pricing.js'
+import { evaluateDiscountCode, REASON_MESSAGES } from '../lib/discountCodes.js'
 
 // "What's stubbed" (SETUP-AND-DEPLOYMENT.md 4.1): "PDF invoices — the
 // invoices table and an invoice email exist, but nothing generates an
@@ -72,6 +73,8 @@ const orderSchema = z
     items: z.array(lineItemSchema).min(1),
     gateway: z.enum(['koko', 'intpay', 'payhere']),
     guest_email: z.string().email().optional(),
+    // Optional discount code — checked again here on the server.
+    discount_code: z.string().max(40).optional(),
 
     // Contact — required for everyone, guest or logged-in, per the
     // checkout requirements.
@@ -300,16 +303,47 @@ router.post('/', async (req, res) => {
     }
 
     const fee = d.delivery_method ? deliveryFee(d.delivery_method, d.delivery_region) : 0
-    const total = subtotal + fee
+    // VIP discount: account-based (guests can't be VIP — there's no
+    // account to attach the rate to), a percentage OFF THE PRODUCT/
+    // SERVICE SUBTOTAL ONLY, never the delivery fee. req.user here is
+    // the raw row attachUser put on the request (see middleware/auth.js),
+    // not a value the browser could have sent — same trust boundary as
+    // every price already computed in this loop.
+    const vipDiscountPercent = Number(req.user?.vip_discount_percent ?? 0)
+    const discountLkr = Math.round(subtotal * (vipDiscountPercent / 100))
     const customerEmail = req.user?.email ?? d.guest_email
+
+    // Discount code (stacks with VIP, item subtotal only). Re-checked here
+    // with the row locked, so the "max uses" limit can't be beaten by two
+    // people checking out at the same instant.
+    let codeRow = null
+    let codeDiscountLkr = 0
+    if (d.discount_code) {
+      const result = await evaluateDiscountCode(client, {
+        code: d.discount_code,
+        subtotal,
+        vipDiscountLkr: discountLkr,
+        userId: req.user?.id ?? null,
+        email: customerEmail,
+        lock: true,
+      })
+      if (!result.ok) {
+        const extra = result.reason === 'min_subtotal' ? ` (minimum Rs. ${Number(result.min_subtotal_lkr).toLocaleString()})` : ''
+        throw new HttpError(400, (REASON_MESSAGES[result.reason] ?? REASON_MESSAGES.not_found).replace(/\.$/, '') + extra + '.')
+      }
+      codeRow = result.codeRow
+      codeDiscountLkr = result.discountLkr
+    }
+    const total = subtotal - discountLkr - codeDiscountLkr + fee
 
     const { rows: orderRows } = await client.query(
       `INSERT INTO orders (
          user_id, guest_email, items, total_lkr, gateway_used,
          customer_first_name, customer_last_name, customer_phone, customer_email,
          delivery_method, delivery_region, pickup_branch_id, delivery_fee_lkr,
-         shipping_address, billing_address, save_card_requested, customer_ip
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+         shipping_address, billing_address, save_card_requested, customer_ip,
+         vip_discount_percent, discount_lkr, discount_code_id, discount_code, code_discount_lkr
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
       [
         userId,
         userId ? null : d.guest_email,
@@ -328,6 +362,11 @@ router.post('/', async (req, res) => {
         billingSnapshot ? JSON.stringify(billingSnapshot) : null,
         Boolean(d.save_card && userId && d.gateway === 'payhere'),
         req.ip,
+        vipDiscountPercent,
+        discountLkr,
+        codeRow?.id ?? null,
+        codeRow?.code ?? null,
+        codeDiscountLkr,
       ]
     )
 

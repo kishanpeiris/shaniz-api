@@ -166,4 +166,28 @@ router.post('/contact', contactLimiter, async (req, res) => {
   res.status(201).json({ ok: true })
 })
 
+// Public: a lightweight first-party page-view counter for the admin
+// dashboard (see db/schema.sql page_views table). Fired from the
+// frontend's router on every navigation, alongside (not instead of)
+// Google Analytics — this exists so the admin dashboard has real traffic
+// numbers without needing a separate Google OAuth/Reporting API
+// integration just to read GA's own data back out.
+//
+// Deliberately forgiving: a malformed body or a failed insert never
+// surfaces as an error to the visitor — a broken page-view beacon should
+// never be something a real customer notices or that blocks navigation.
+const pageviewSchema = z.object({ path: z.string().trim().min(1).max(500) })
+
+router.post('/pageview', async (req, res) => {
+  const parsed = pageviewSchema.safeParse(req.body)
+  if (parsed.success) {
+    try {
+      await query(`INSERT INTO page_views (path) VALUES ($1)`, [parsed.data.path])
+    } catch (err) {
+      console.error('[pageview] insert failed:', err.message)
+    }
+  }
+  res.status(204).end()
+})
+
 export default router

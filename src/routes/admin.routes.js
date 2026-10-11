@@ -23,7 +23,25 @@ const router = Router()
 
 // ---- Dashboard (Section 8) ----
 router.get('/dashboard', async (req, res) => {
-  const [revenue, ordersByStatus, upcomingBookings, topProducts, lowStock, gatewaySplit, aov, signups, guestRatio, openFraudFlags, recentFraudFlags, failedAdminLogins, newAdmins, openRefundRequests] =
+  const [
+    revenue,
+    ordersByStatus,
+    upcomingBookings,
+    topProducts,
+    lowStock,
+    gatewaySplit,
+    aov,
+    signups,
+    guestRatio,
+    openFraudFlags,
+    recentFraudFlags,
+    failedAdminLogins,
+    newAdmins,
+    openRefundRequests,
+    pageViewsByDay,
+    pageViewsTotal30d,
+    topPages,
+  ] =
     await Promise.all([
       query(`SELECT date_trunc('day', created_at) AS day, SUM(total_lkr) AS revenue
              FROM orders WHERE status IN ('paid','shipped','completed') AND created_at > now() - interval '30 days'
@@ -50,6 +68,16 @@ router.get('/dashboard', async (req, res) => {
                AND la.created_at > now() - interval '24 hours'`),
       query(`SELECT COUNT(*)::int AS n FROM users WHERE role IN ('admin','superadmin') AND created_at > now() - interval '7 days'`),
       query(`SELECT COUNT(*)::int AS n FROM refund_requests WHERE status = 'pending'`),
+      // Page views: daily totals for the last 30 days (same shape as
+      // revenue_by_day, so the frontend can reuse the same line-chart
+      // component), a plain 30-day total, and the 5 most-visited paths.
+      query(`SELECT date_trunc('day', created_at) AS day, COUNT(*) AS views
+             FROM page_views WHERE created_at > now() - interval '30 days'
+             GROUP BY 1 ORDER BY 1`),
+      query(`SELECT COUNT(*)::int AS n FROM page_views WHERE created_at > now() - interval '30 days'`),
+      query(`SELECT path, COUNT(*)::int AS views FROM page_views
+             WHERE created_at > now() - interval '30 days'
+             GROUP BY path ORDER BY views DESC LIMIT 5`),
     ])
 
   // Top products by revenue/units — computed in JS since items live in JSONB.
@@ -78,6 +106,9 @@ router.get('/dashboard', async (req, res) => {
     new_signups_by_day: signups.rows,
     guest_vs_logged_in: guestRatio.rows[0],
     open_refund_requests: openRefundRequests.rows[0].n,
+    page_views_by_day: pageViewsByDay.rows,
+    page_views_30d: pageViewsTotal30d.rows[0].n,
+    top_pages: topPages.rows,
     security: {
       open_fraud_flags: openFraudFlags.rows[0].n,
       recent_fraud_flags: recentFraudFlags.rows,
@@ -327,7 +358,7 @@ router.get('/customers', async (req, res) => {
   const { rows } = await query(
     `SELECT
        u.id, u.name, u.first_name, u.last_name, u.email, u.mobile,
-       u.email_verified, u.disabled, u.created_at,
+       u.email_verified, u.disabled, u.created_at, u.vip_discount_percent,
        COALESCE(o.order_count, 0) AS order_count,
        COALESCE(o.total_spent_lkr, 0) AS total_spent_lkr,
        COALESCE(b.booking_count, 0) AS booking_count
@@ -392,7 +423,7 @@ router.get('/export/customers.csv', async (req, res) => {
   const { rows } = await query(
     `SELECT
        u.id, u.name, u.first_name, u.last_name, u.email, u.mobile,
-       u.email_verified, u.disabled, u.created_at,
+       u.email_verified, u.disabled, u.created_at, u.vip_discount_percent,
        COALESCE(o.order_count, 0) AS order_count,
        COALESCE(o.total_spent_lkr, 0) AS total_spent_lkr,
        COALESCE(b.booking_count, 0) AS booking_count
@@ -420,6 +451,7 @@ router.get('/export/customers.csv', async (req, res) => {
     { header: 'Order Count', get: (c) => c.order_count },
     { header: 'Total Spent (LKR)', get: (c) => c.total_spent_lkr },
     { header: 'Booking Count', get: (c) => c.booking_count },
+    { header: 'VIP Discount %', get: (c) => c.vip_discount_percent },
   ])
 
   await logBoth(req.user.id, 'export.customers_csv', null, { row_count: rows.length })
@@ -434,7 +466,7 @@ router.get('/export/customers.csv', async (req, res) => {
 router.get('/customers/:id', async (req, res) => {
   const [user, addresses, orders, bookings] = await Promise.all([
     query(
-      `SELECT id, name, first_name, last_name, email, mobile, email_verified, disabled, created_at
+      `SELECT id, name, first_name, last_name, email, mobile, email_verified, disabled, created_at, vip_discount_percent
        FROM users WHERE id = $1 AND role = 'customer'`,
       [req.params.id]
     ),
@@ -471,6 +503,23 @@ router.put('/customers/:id/disabled', async (req, res) => {
   )
   if (!rows[0]) return res.status(404).json({ error: 'Customer not found.' })
   await logBoth(req.user.id, parsed.data.disabled ? 'customer.disabled' : 'customer.enabled', rows[0].id)
+  res.json({ customer: rows[0] })
+})
+
+// VIP status is just "vip_discount_percent > 0" — setting it to 0 removes
+// VIP status and the gold badge; any value above 0 grants both. Applied
+// automatically at checkout (orders.routes.js) and shown there before
+// the customer pays, not a surprise discount that only appears after.
+router.put('/customers/:id/vip-discount', async (req, res) => {
+  const parsed = z.object({ vip_discount_percent: z.number().min(0).max(100) }).safeParse(req.body)
+  if (!parsed.success) return res.status(400).json({ error: 'Enter a discount between 0 and 100.' })
+
+  const { rows } = await query(
+    `UPDATE users SET vip_discount_percent = $1 WHERE id = $2 AND role = 'customer' RETURNING id, vip_discount_percent`,
+    [parsed.data.vip_discount_percent, req.params.id]
+  )
+  if (!rows[0]) return res.status(404).json({ error: 'Customer not found.' })
+  await logBoth(req.user.id, 'customer.vip_discount_updated', rows[0].id, { vip_discount_percent: parsed.data.vip_discount_percent })
   res.json({ customer: rows[0] })
 })
 
